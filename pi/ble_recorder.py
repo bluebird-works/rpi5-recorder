@@ -36,7 +36,21 @@ PRESETS = [
     (1920, 1080, 30, 10_000_000, "hardware"),  # 0: 1080p30 HW (дефолт)
     (1280, 720,  30,  6_000_000, "hardware"),  # 1: 720p30 HW (легкий)
     (2304, 1296, 30, 15_000_000, "software"),  # 2: 1296p30 SW (треба охолодження)
+    (1536,  864, 120, 8_000_000, "software"),  # 3: 120fps SW (Pi 5, турель, кроп FoV)
+    (2304, 1296,  56, 15_000_000, "software"), # 4: 56fps SW  (Pi 5, турель, full FoV)
 ]
+
+# Manual mode (cmd 0x03) шле JSON-конфіг з веб-UI. Ліміти — санітарна перевірка
+# рпicam-vid параметрів, а не бізнес-обмеження.
+MANUAL_LIMITS = {
+    "width":      (128, 4608),
+    "height":     (96, 2592),
+    "fps":        (1, 120),
+    "bitrate":    (500_000, 100_000_000),
+    "shutter_us": (0, 1_000_000),   # 0 = auto
+}
+VALID_ENCODERS = {"auto", "hardware", "software"}
+VALID_AF_MODES = {"manual", "continuous", "auto"}
 
 # Env-defaults для сумісності: якщо start-команда прийшла без байта пресета
 # (старий клієнт), беремо дефолти з env або перший пресет.
@@ -212,7 +226,45 @@ def _resolve_preset(preset_id):
     return PRESETS[0]
 
 
-def _start_pipeline(width, height, fps, bitrate, encoder_hint):
+def _validate_manual(cfg):
+    """Витягує і валідує manual-конфіг з BLE-JSON. Повертає dict з нормалізованими
+    полями або None якщо валідація впала."""
+    out = {}
+    for key, (lo, hi) in MANUAL_LIMITS.items():
+        if key in cfg and cfg[key] is not None:
+            try:
+                v = int(cfg[key])
+            except (TypeError, ValueError):
+                log.warning("manual: bad int for %s: %r", key, cfg[key])
+                return None
+            if not (lo <= v <= hi):
+                log.warning("manual: %s=%d out of [%d,%d]", key, v, lo, hi)
+                return None
+            out[key] = v
+    enc = cfg.get("encoder", DEFAULT_ENCODER)
+    if enc not in VALID_ENCODERS:
+        log.warning("manual: bad encoder %r", enc)
+        return None
+    out["encoder"] = enc
+    af = cfg.get("af_mode", AUTOFOCUS_MODE)
+    if af not in VALID_AF_MODES:
+        log.warning("manual: bad af_mode %r", af)
+        return None
+    out["af_mode"] = af
+    lens = cfg.get("lens_position", LENS_POSITION)
+    # lens_position: або число (float), або "default". Валідуємо як float.
+    if lens != "default":
+        try:
+            float(lens)
+        except (TypeError, ValueError):
+            log.warning("manual: bad lens_position %r", lens)
+            return None
+    out["lens_position"] = str(lens)
+    return out
+
+
+def _start_pipeline(width, height, fps, bitrate, encoder_hint,
+                    shutter_us=0, af_mode=None, lens_position=None):
     """rpicam-vid → ffmpeg → mp4. Повертає (cam, ff, out_path) або (None, None, None)."""
     # Сегмент ріжеться тільки по keyframe, тому GOP = довжині сегмента.
     intra = fps * SEGMENT_SEC if SEGMENT_SEC > 0 else fps
@@ -224,10 +276,17 @@ def _start_pipeline(width, height, fps, bitrate, encoder_hint):
     # AF-контроли валідні лише для сенсорів з моторним фокусом (Camera Module 3).
     # На IMX219/IMX477/тощо rpicam-vid зʼїсть їх мовчки або впаде — і в другому
     # випадку ffmpeg лишає 0-байтний mp4.
+    af = af_mode or AUTOFOCUS_MODE
+    lens = lens_position if lens_position is not None else LENS_POSITION
     if CAMERA is None or CAMERA["has_autofocus"]:
-        cam_cmd += ["--autofocus-mode", AUTOFOCUS_MODE]
-        if AUTOFOCUS_MODE == "manual":
-            cam_cmd += ["--lens-position", LENS_POSITION]
+        cam_cmd += ["--autofocus-mode", af]
+        if af == "manual":
+            cam_cmd += ["--lens-position", lens]
+    # Фіксований shutter — критично для швидких обʼєктів (дрон): без цього AE
+    # може капнути shutter до довжини кадру (напр. 8 ms при 120 fps) і дати
+    # motion blur. 0 = auto (як зараз, libcamera сам вибирає).
+    if shutter_us and shutter_us > 0:
+        cam_cmd += ["--shutter", str(shutter_us)]
 
     # -flush_packets 1: не тримати пакети в user-space буфері ffmpeg. Без цього
     # sync-loop нижче flushit'ь пусті сторінки — фрагменти mp4 не встигають
@@ -302,9 +361,12 @@ def _start_pipeline(width, height, fps, bitrate, encoder_hint):
         return None, None, None
 
     log.info(
-        "pipeline start %dx%d@%d encoder=%s af=%s sensor=%s",
-        width, height, fps, "hardware" if hardware else "software",
-        AUTOFOCUS_MODE if (CAMERA is None or CAMERA["has_autofocus"]) else "n/a",
+        "pipeline start %dx%d@%d br=%d encoder=%s af=%s lens=%s shutter=%s sensor=%s",
+        width, height, fps, bitrate,
+        "hardware" if hardware else "software",
+        af if (CAMERA is None or CAMERA["has_autofocus"]) else "n/a",
+        lens if af == "manual" else "-",
+        shutter_us if shutter_us else "auto",
         CAMERA["sensor"] if CAMERA else "unknown",
     )
     return cam, ff, out_path
@@ -325,15 +387,29 @@ def _sync_loop(stop_event):
             log.warning("sync failed: %s", e)
 
 
-def start_recording(preset_id=None):
+def start_recording(preset_id=None, manual=None):
     with lock:
         if state["recording"]:
             return False
-        w, h, fps, br, enc = _resolve_preset(preset_id)
+        if manual is not None:
+            w  = manual.get("width",   DEFAULT_WIDTH)
+            h  = manual.get("height",  DEFAULT_HEIGHT)
+            fps = manual.get("fps",    DEFAULT_FPS)
+            br  = manual.get("bitrate", DEFAULT_BITRATE)
+            enc = manual.get("encoder", DEFAULT_ENCODER)
+            shutter = manual.get("shutter_us", 0)
+            af = manual.get("af_mode", AUTOFOCUS_MODE)
+            lens = manual.get("lens_position", LENS_POSITION)
+        else:
+            w, h, fps, br, enc = _resolve_preset(preset_id)
+            shutter, af, lens = 0, None, None
         rotate_old_files()
-        cam, ff, out_path = _start_pipeline(w, h, fps, br, enc)
+        cam, ff, out_path = _start_pipeline(
+            w, h, fps, br, enc,
+            shutter_us=shutter, af_mode=af, lens_position=lens,
+        )
         if cam is None:
-            log.warning("REC start failed preset=%s", preset_id)
+            log.warning("REC start failed preset=%s manual=%s", preset_id, bool(manual))
             return False
         stop_event = threading.Event()
         rot_t = threading.Thread(target=_rotator_loop, args=(stop_event,), daemon=True)
@@ -468,11 +544,24 @@ def on_write(value, options):
     if cmd == 0x01:
         # Другий байт — індекс пресета (див. PRESETS). Опційний для сумісності.
         preset_id = value[1] if len(value) > 1 else None
-        start_recording(preset_id)
+        start_recording(preset_id=preset_id)
     elif cmd == 0x00:
         stop_recording()
     elif cmd == 0x02:
         threading.Thread(target=_snapshot_flow, daemon=True).start()
+    elif cmd == 0x03:
+        # Manual config: після байту команди — UTF-8 JSON.
+        # Влазить у стандартний ATT_MTU=185 (payload ~180 B); UI пакує
+        # тільки задані поля, тому запас великий.
+        try:
+            cfg = json.loads(bytes(value[1:]).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            log.warning("manual: bad JSON: %s", e)
+            return
+        norm = _validate_manual(cfg)
+        if norm is None:
+            return
+        start_recording(manual=norm)
     else:
         log.warning("unknown cmd byte: 0x%02x", cmd)
 

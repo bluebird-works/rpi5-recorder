@@ -76,7 +76,41 @@
     <option value="0">1080p @ 30 fps · HW · дефолт</option>
     <option value="1">720p @ 30 fps · HW · легкий</option>
     <option value="2">1296p @ 30 fps · SW · треба охолодження</option>
+    <option value="3">1536×864 @ 120 fps · SW · турель, кроп FoV</option>
+    <option value="4">2304×1296 @ 56 fps · SW · турель, full FoV</option>
   </select>
+
+  <details id="manualPanel">
+    <summary>Ручні налаштування (перевизначає пресет)</summary>
+    <label style="display:flex;gap:8px;align-items:center;margin:8px 0">
+      <input id="manualEnabled" type="checkbox">
+      Використати мануальні параметри
+    </label>
+    <label>Width (128–4608)</label>
+    <input id="mWidth" type="number" min="128" max="4608" value="1536">
+    <label>Height (96–2592)</label>
+    <input id="mHeight" type="number" min="96" max="2592" value="864">
+    <label>FPS (1–120)</label>
+    <input id="mFps" type="number" min="1" max="120" value="120">
+    <label>Bitrate, bps (500k–100M)</label>
+    <input id="mBitrate" type="number" min="500000" max="100000000" step="500000" value="8000000">
+    <label>Encoder</label>
+    <select id="mEncoder" style="width:100%;padding:8px;margin:4px 0 8px;border:1px solid #bbb;border-radius:6px">
+      <option value="auto">auto (Pi 4=HW, Pi 5=SW)</option>
+      <option value="hardware">hardware (Pi 4 тільки)</option>
+      <option value="software" selected>software (обовʼязково для Pi 5 і >1920 ширини)</option>
+    </select>
+    <label>Shutter (мкс, 0=auto). Проти motion blur — 2000–5000</label>
+    <input id="mShutter" type="number" min="0" max="1000000" step="100" value="0">
+    <label>Autofocus mode</label>
+    <select id="mAf" style="width:100%;padding:8px;margin:4px 0 8px;border:1px solid #bbb;border-radius:6px">
+      <option value="manual" selected>manual (фіксований фокус)</option>
+      <option value="continuous">continuous</option>
+      <option value="auto">auto</option>
+    </select>
+    <label>Lens position (0=inf, число=діоптрії, "default"=гіперфокал)</label>
+    <input id="mLens" value="0">
+  </details>
 
   <button id="snap" disabled>📸 Знімок для перевірки кадрування</button>
   <figure id="snapWrap" hidden>
@@ -255,6 +289,65 @@ async function sendStart(preset) {
   await chrCmd.writeValue(Uint8Array.of(0x01, preset & 0xff));
 }
 
+// Manual mode: одним GATT write кидаємо cmd byte 0x03 + UTF-8 JSON.
+// Payload ≤ MTU-3 (~180 B на стандартному ATT_MTU=185); шлемо тільки задані поля.
+async function sendStartManual(cfg) {
+  if (!chrCmd) return;
+  const json = new TextEncoder().encode(JSON.stringify(cfg));
+  const packet = new Uint8Array(1 + json.length);
+  packet[0] = 0x03;
+  packet.set(json, 1);
+  if (packet.length > 180) {
+    log("manual config занадто великий (" + packet.length + " B)");
+    return;
+  }
+  await chrCmd.writeValue(packet);
+}
+
+function collectManual() {
+  const cfg = {
+    width:      parseInt($("mWidth").value,   10),
+    height:     parseInt($("mHeight").value,  10),
+    fps:        parseInt($("mFps").value,     10),
+    bitrate:    parseInt($("mBitrate").value, 10),
+    encoder:    $("mEncoder").value,
+    shutter_us: parseInt($("mShutter").value, 10) || 0,
+    af_mode:    $("mAf").value,
+    lens_position: $("mLens").value.trim() || "0",
+  };
+  for (const k of ["width", "height", "fps", "bitrate"]) {
+    if (!Number.isFinite(cfg[k]) || cfg[k] <= 0) {
+      log("manual: заповни поле " + k);
+      return null;
+    }
+  }
+  return cfg;
+}
+
+function saveManualToStorage() {
+  const cfg = collectManual();
+  if (cfg) localStorage.setItem("manualCfg", JSON.stringify(cfg));
+  localStorage.setItem("manualEnabled", $("manualEnabled").checked ? "1" : "0");
+}
+
+function loadManualFromStorage() {
+  const saved = localStorage.getItem("manualCfg");
+  if (saved) {
+    try {
+      const cfg = JSON.parse(saved);
+      if (cfg.width)   $("mWidth").value   = cfg.width;
+      if (cfg.height)  $("mHeight").value  = cfg.height;
+      if (cfg.fps)     $("mFps").value     = cfg.fps;
+      if (cfg.bitrate) $("mBitrate").value = cfg.bitrate;
+      if (cfg.encoder) $("mEncoder").value = cfg.encoder;
+      if (cfg.shutter_us != null) $("mShutter").value = cfg.shutter_us;
+      if (cfg.af_mode) $("mAf").value = cfg.af_mode;
+      if (cfg.lens_position != null) $("mLens").value = cfg.lens_position;
+    } catch (_) {}
+  }
+  $("manualEnabled").checked = localStorage.getItem("manualEnabled") === "1";
+}
+
 async function sendStop() {
   if (!chrCmd) return;
   await chrCmd.writeValue(Uint8Array.of(0x00));
@@ -328,10 +421,14 @@ window.addEventListener("pagehide", () => {
 });
 
 loadCfg();
+loadManualFromStorage();
 const savedPreset = localStorage.getItem("preset");
 if (savedPreset !== null) $("preset").value = savedPreset;
 $("preset").addEventListener("change", () =>
   localStorage.setItem("preset", $("preset").value));
+for (const id of ["mWidth","mHeight","mFps","mBitrate","mEncoder","mShutter","mAf","mLens","manualEnabled"]) {
+  $(id).addEventListener("change", saveManualToStorage);
+}
 
 // Скидання для юзерів, які не вміють чистити кеш браузера / забувати пристрій
 // у BT-налаштуваннях телефона. Робить максимум що дозволяє Web Bluetooth API:
@@ -362,8 +459,14 @@ $("disc").onclick = disconnect;
 $("snap").onclick = snapshot;
 $("reset").onclick = fullReset;
 $("rec").onclick  = async () => {
-  const preset = parseInt($("preset").value, 10) || 0;
-  await sendStart(preset);
+  if ($("manualEnabled").checked) {
+    const cfg = collectManual();
+    if (!cfg) return;
+    await sendStartManual(cfg);
+  } else {
+    const preset = parseInt($("preset").value, 10) || 0;
+    await sendStart(preset);
+  }
   setRecUI(true);
   // Під час запису rpicam-jpeg не працює — камера зайнята.
   $("snap").disabled = true;
