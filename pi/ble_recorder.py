@@ -28,13 +28,15 @@ MAX_FILES = int(os.environ.get("MAX_FILES", 50))
 # без цього ffmpeg-пакети сидять у page cache і при відвалі живлення ext4
 # з delayed alloc лишає файл нульового розміру. 0 = вимкнути.
 SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", 3))
+# Скільки чекати на ознаку живого пайплайна перш ніж вважати старт успішним.
+PIPELINE_START_TIMEOUT = float(os.environ.get("PIPELINE_START_TIMEOUT", 3))
 
 # Пресети, які веб-UI обирає другим байтом start-команди.
 # Порядок мусить збігатися з <select> у index.html.
 # (width, height, fps, bitrate, encoder_hint)
 PRESETS = [
-    (1920, 1080, 30, 10_000_000, "hardware"),  # 0: 1080p30 HW (дефолт)
-    (1280, 720,  30,  6_000_000, "hardware"),  # 1: 720p30 HW (легкий)
+    (1920, 1080, 30, 10_000_000, "auto"),      # 0: 1080p30 (дефолт) — HW на Pi 4, SW на Pi 5
+    (1280, 720,  30,  6_000_000, "auto"),      # 1: 720p30 (легкий)  — HW на Pi 4, SW на Pi 5
     (2304, 1296, 30, 15_000_000, "software"),  # 2: 1296p30 SW (треба охолодження)
     (1536,  864, 120, 8_000_000, "software"),  # 3: 120fps SW (Pi 5, турель, кроп FoV)
     (2304, 1296,  56, 15_000_000, "software"), # 4: 56fps SW  (Pi 5, турель, full FoV)
@@ -340,7 +342,16 @@ def _start_pipeline(width, height, fps, bitrate, encoder_hint,
 
     # Якщо rpicam-vid здох на старті (несумісні флаги, відсутній сенсор) —
     # ffmpeg отримає EOF і закриє файл 0-байтовим. Ловимо це тут.
-    time.sleep(0.5)
+    # Чекаємо не фіксовану паузу, а подію: або процес помер, або в mp4 пішли
+    # перші байти. Фіксовані 0.5 с давали фальшивий "REC start" — камера на
+    # великих роздільностях ініціалізується довше і падала вже після перевірки.
+    deadline = time.monotonic() + PIPELINE_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if cam.poll() is not None:
+            break
+        if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            break
+        time.sleep(0.1)
     if cam.poll() is not None:
         log.error("rpicam-vid exited at start with code %d", cam.returncode)
         try:
