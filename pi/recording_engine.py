@@ -49,6 +49,7 @@ STATE_FILE = os.path.join(REC_DIR, ".recording_state")
 state = {
     "recording": False, "cam": None, "ff": None, "stop_event": None,
     "rot_thread": None, "sync_thread": None, "out_path": None,
+    "stopping": False,
 }
 lock = threading.Lock()
 
@@ -301,6 +302,7 @@ def start_recording():
         state.update(
             recording=True, cam=cam, ff=ff, stop_event=stop_event,
             rot_thread=rot_t, sync_thread=sync_t, out_path=out_path,
+            stopping=False,
         )
         _persist_state(True)
         log.info("REC start segments=%ds sync=%ds", SEGMENT_SEC, SYNC_INTERVAL_SEC)
@@ -311,6 +313,9 @@ def stop_recording():
     with lock:
         if not state["recording"]:
             return False
+        if state["stopping"]:
+            return False
+        state["stopping"] = True
         cam = state["cam"]
         ff = state["ff"]
         stop_event = state["stop_event"]
@@ -338,6 +343,7 @@ def stop_recording():
         state.update(
             recording=False, cam=None, ff=None, stop_event=None,
             rot_thread=None, sync_thread=None, out_path=None,
+            stopping=False,
         )
     _persist_state(False)
     log.info("REC stop")
@@ -351,4 +357,5 @@ def get_status():
             "filename": (
                 os.path.basename(state["out_path"]) if state["out_path"] else None
             ),
+            "stopping": state["stopping"],
         }

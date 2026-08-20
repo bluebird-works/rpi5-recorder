@@ -33,19 +33,39 @@ INDEX_HTML = """<!doctype html>
 <button id="stop">Стоп</button>
 <script>
 async function refresh() {
-  const r = await fetch('/api/status');
-  const s = await r.json();
   const el = document.getElementById('status');
-  el.className = s.recording ? 'recording' : '';
-  el.textContent = s.recording
-    ? 'Recording: ' + (s.filename || '…')
-    : 'Idle';
-  document.getElementById('start').disabled = s.recording;
-  document.getElementById('stop').disabled = !s.recording;
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    el.className = s.recording ? 'recording' : '';
+    el.textContent = s.recording
+      ? 'Recording: ' + (s.filename || '…')
+      : 'Idle';
+    document.getElementById('start').disabled = s.recording;
+    document.getElementById('stop').disabled = !s.recording;
+  } catch (e) {
+    el.className = '';
+    el.textContent = 'нема звʼязку з рекордером';
+    document.getElementById('start').disabled = true;
+    document.getElementById('stop').disabled = true;
+  }
 }
 async function post(path) {
-  await fetch(path, {method: 'POST'});
-  refresh();
+  try {
+    const r = await fetch(path, {method: 'POST'});
+    const body = await r.json();
+    if (body.ok) {
+      // Успіх — одразу підтягуємо новий статус.
+      refresh();
+    } else {
+      // Провал: лишаємо повідомлення на екрані, найближчий periodic
+      // refresh() (setInterval нижче) підмінить його реальним статусом
+      // за ~2с — не перетираємо його миттєво власним викликом.
+      document.getElementById('status').textContent = 'команда не виконана';
+    }
+  } catch (e) {
+    document.getElementById('status').textContent = 'нема звʼязку з рекордером';
+  }
 }
 document.getElementById('start').addEventListener('click', () => post('/api/start'));
 document.getElementById('stop').addEventListener('click', () => post('/api/stop'));
