@@ -40,33 +40,65 @@ INDEX_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RPi Recorder</title>
 <style>
-  body { font-family: sans-serif; max-width: 680px; margin: 1.5rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.25rem; }
-  h2 { font-size: 1rem; margin-top: 1.6rem; }
-  #status { font-size: 1.1rem; margin: 1rem 0; }
-  #status.recording { color: #b00020; font-weight: bold; }
-  button { font-size: 1rem; padding: 0.5rem 1rem; margin-right: 0.4rem; }
-  label.raw { font-size: 0.95rem; margin-left: 0.3rem; }
-  table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; font-size: 0.9rem; }
-  th, td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left; }
-  th { background: #f2f2f2; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto;
+         padding: 1rem 1rem 3rem; color: #1a1a1a; background: #fafafa; }
+  h1 { font-size: 1.4rem; margin: 0.3rem 0 0.2rem; }
+  .sub { color: #666; font-size: 0.9rem; margin: 0 0 1.2rem; }
+  h2 { font-size: 1.05rem; margin: 1.8rem 0 0.2rem; }
+  .hint { color: #666; font-size: 0.85rem; margin: 0 0 0.6rem; }
+
+  /* Великий статус-банер: зелений = пише, сірий = стоїть */
+  #status { font-size: 1.15rem; font-weight: bold; padding: 0.9rem 1rem;
+            border-radius: 10px; margin: 0.4rem 0 1rem; text-align: center;
+            background: #e8e8e8; color: #333; }
+  #status.recording { background: #b00020; color: #fff; }
+
+  /* Дві великі очевидні кнопки */
+  .controls { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  button { font-size: 1.05rem; padding: 0.7rem 1.4rem; border: none;
+           border-radius: 8px; cursor: pointer; font-weight: bold; }
+  #start { background: #128a2b; color: #fff; }
+  #stop  { background: #b00020; color: #fff; }
+  button:disabled { background: #ccc; color: #888; cursor: not-allowed; }
+  label.raw { font-size: 0.95rem; display: flex; align-items: center; gap: 0.3rem; }
+  label.raw input { width: 1.1rem; height: 1.1rem; }
+
+  table { border-collapse: collapse; width: 100%; margin-top: 0.3rem;
+          font-size: 0.9rem; background: #fff; }
+  th, td { border: 1px solid #ddd; padding: 0.45rem 0.5rem; text-align: left; }
+  th { background: #f0f0f0; }
   td.rec { color: #b00020; font-weight: bold; }
-  .act a, .act button { font-size: 0.85rem; margin-right: 0.3rem; }
-  form.ap input { font-size: 1rem; padding: 0.35rem; margin: 0.2rem 0; width: 14rem; }
-  #apmsg, #tablemsg { font-size: 0.9rem; color: #444; }
-  dialog { padding: 1.2rem; max-width: 22rem; }
-  dialog button { margin-top: 0.8rem; }
+  .act a, .act button { font-size: 0.85rem; padding: 0.3rem 0.7rem; }
+  .act a { display: inline-block; background: #128a2b; color: #fff;
+           text-decoration: none; border-radius: 6px; margin-right: 0.3rem; }
+  .act button.del { background: #b00020; color: #fff; }
+  .empty { color: #888; font-size: 0.9rem; padding: 0.6rem 0; }
+
+  form.ap input { font-size: 1rem; padding: 0.5rem; margin: 0.2rem 0;
+                  width: 100%; max-width: 18rem; box-sizing: border-box;
+                  border: 1px solid #bbb; border-radius: 6px; }
+  form.ap button { background: #1a5fb4; color: #fff; margin-top: 0.4rem; }
+  #apmsg, #tablemsg { font-size: 0.9rem; color: #444; margin-top: 0.4rem; }
+  dialog { padding: 1.3rem; max-width: 22rem; border: none; border-radius: 12px;
+           box-shadow: 0 8px 30px rgba(0,0,0,0.25); }
+  dialog button { margin-top: 1rem; }
+  #confirmyes { background: #b00020; color: #fff; }
+  #confirmno { background: #ddd; color: #333; }
 </style>
 </head>
 <body>
 <h1>RPi Recorder</h1>
+<p class="sub">Керування камерою. Тисни «Старт» щоб почати запис, «Стоп» щоб зупинити.</p>
 
 <div id="status">завантаження…</div>
-<button id="start">Старт</button>
-<button id="stop">Стоп</button>
-<label class="raw"><input type="checkbox" id="raw"> raw-data</label>
+<div class="controls">
+  <button id="start">● Старт</button>
+  <button id="stop">■ Стоп</button>
+  <label class="raw"><input type="checkbox" id="raw"> raw (сира зйомка, їсть багато місця — хвилини на карту)</label>
+</div>
 
 <h2>Записи</h2>
+<p class="hint">Твої відео. «Download» — скачати на телефон, «Delete» — видалити (спитає підтвердження).</p>
 <div id="tablemsg"></div>
 <table id="files">
   <thead><tr>
@@ -75,10 +107,11 @@ INDEX_HTML = """<!doctype html>
   <tbody></tbody>
 </table>
 
-<h2>Точка доступу</h2>
+<h2>Точка доступу (WiFi)</h2>
+<p class="hint">Зміни ім'я мережі та пароль — якщо поруч кілька рекордерів, щоб не плутати. Увага: після зміни телефон відключиться, треба буде підключитись до нової мережі.</p>
 <form class="ap" id="apform">
-  <div><input id="ssid" placeholder="SSID" maxlength="32" required></div>
-  <div><input id="psk" placeholder="Пароль (8–63)" minlength="8" maxlength="63" required></div>
+  <div><input id="ssid" placeholder="Ім'я мережі (SSID)" maxlength="32" required></div>
+  <div><input id="psk" placeholder="Пароль (8–63 символи)" minlength="8" maxlength="63" required></div>
   <button type="submit">Зберегти й застосувати</button>
 </form>
 <div id="apmsg"></div>
@@ -107,12 +140,12 @@ async function refresh() {
     const s = await r.json();
     el.className = s.recording ? 'recording' : '';
     if (s.recording) {
-      el.textContent = (s.raw ? 'Raw recording: ' : 'Recording: ') + (s.filename || '…')
-        + (s.stopping ? ' (зупиняється…)' : '');
+      el.textContent = (s.stopping ? '⏹ Зупиняється…'
+        : (s.raw ? '● ЗАПИС (raw): ' : '● ЙДЕ ЗАПИС: ') + (s.filename || '…'));
     } else if (s.last_stop_reason === 'low_space') {
-      el.textContent = 'Idle — зупинено: мало місця на диску';
+      el.textContent = '⚠ Зупинено — скінчилось місце на карті';
     } else {
-      el.textContent = 'Idle';
+      el.textContent = 'Не пише (натисни «Старт»)';
     }
     document.getElementById('start').disabled = s.recording;
     document.getElementById('stop').disabled = !s.recording;
@@ -130,6 +163,11 @@ async function refreshFiles() {
     const r = await fetch('/api/files');
     const rows = await r.json();
     tb.innerHTML = '';
+    document.getElementById('tablemsg').textContent = '';
+    if (rows.length === 0) {
+      tb.innerHTML = '<tr><td colspan="5" class="empty">Ще нема записів. Натисни «Старт».</td></tr>';
+      return;
+    }
     for (const f of rows) {
       const tr = document.createElement('tr');
       const isRec = f.status === 'recording';
@@ -141,7 +179,7 @@ async function refreshFiles() {
         '<td>' + f.name + '</td>' +
         '<td>' + fmtSize(f.size) + '</td>' +
         '<td>' + fmtDate(f.created) + '</td>' +
-        '<td class="' + (isRec ? 'rec' : '') + '">' + (isRec ? 'Recording' : 'Saved') + '</td>' +
+        '<td class="' + (isRec ? 'rec' : '') + '">' + (isRec ? '● пишеться' : 'готово') + '</td>' +
         '<td class="act">' + actions + '</td>';
       tb.appendChild(tr);
     }
