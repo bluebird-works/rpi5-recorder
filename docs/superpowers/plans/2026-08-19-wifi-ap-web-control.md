@@ -21,6 +21,7 @@
 - Flask's built-in dev server (`app.run(..., threaded=True)`) is intentionally used instead of a production WSGI server — single client on a closed AP network, no internet exposure.
 - Web service binds port 80 without running as root, via `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the systemd unit (same least-privilege pattern as the existing BLE unit).
 - No live Raspberry Pi hardware was available to test against while writing this plan (`recorder` and `recorder2` were offline in the Tailscale tailnet) — flag this explicitly in the PR description.
+- `install_web.sh` installs `dnsmasq-base` explicitly, not relying on it being pulled in as a `Recommends` of `network-manager` — `ipv4.method shared` needs it for DHCP, and a minimal/headless image with `Install-Recommends "false"` would otherwise let the AP come up with no error while silently handing out no IPs to clients.
 
 ---
 
@@ -806,7 +807,9 @@ if __name__ == "__main__":
     resumed = engine._load_state()
     if resumed and resumed.get("active"):
         engine.log.info("resuming recording after boot")
-        engine.start_recording()
+        if not engine.start_recording():
+            engine.log.warning("resume failed, clearing state")
+            engine._persist_state(False)
 
     create_app().run(host="0.0.0.0", port=WEB_PORT, threaded=True)
 ```
@@ -856,7 +859,11 @@ AP_IFACE="${AP_IFACE:-wlan0}"
 AP_CON_NAME="rpi-web-ap"
 
 apt-get update
-apt-get install -y ffmpeg rpicam-apps python3-flask network-manager
+# dnsmasq-base: без нього ipv4.method=shared не роздає DHCP клієнтам AP.
+# Це лише Recommends пакета network-manager, не Depends — на мінімальному
+# образі з Install-Recommends=false міг би тихо не встановитись, тому тут
+# явно.
+apt-get install -y ffmpeg rpicam-apps python3-flask network-manager dnsmasq-base
 
 # Trixie підняв AP через NetworkManager нативно — hostapd/dnsmasq тут
 # свідомо не піднімаємо (див. спек). Якщо NM не активний — falшивий шлях
@@ -934,7 +941,7 @@ Expected: no output (bash -n only reports syntax errors; none expected).
 - [ ] **Step 3: Manual review checklist (no live Pi available — document this in the PR)**
 
 Confirm each of these against the spec (`docs/superpowers/specs/2026-08-19-wifi-ap-web-control-design.md`) and this plan's Global Constraints, by reading the script, not by running it:
-- `apt-get install` list matches what `web_recorder.py`/`recording_engine.py` actually import (Flask, ffmpeg, rpicam-apps) — no extra packages.
+- `apt-get install` list matches what `web_recorder.py`/`recording_engine.py` actually import (Flask, ffmpeg, rpicam-apps) plus `dnsmasq-base` for AP DHCP (see Global Constraints) — no other extra packages.
 - The `NetworkManager` active-check happens before any `nmcli` call, with a clear failure message and non-zero exit.
 - The systemd unit's `AmbientCapabilities`/`CapabilityBoundingSet` lines are present so `WEB_PORT=80` works without `User=root`.
 - `ExecStartPre` brings up the AP profile with `+` (root), matching how `install_ble.sh` runs `rfkill`/`hciconfig` as root while the service itself runs as `${REC_USER}`.
