@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - `pi/ble_recorder.py` is NOT modified, NOT imported from, and does not import the new code. Zero changes to that file in this plan.
-- Network layer uses `nmcli` AP profiles (`ipv4.method shared`), never hostapd/dnsmasq.
+- Network layer uses `nmcli` AP profiles (`ipv4.method shared`), never a manually-configured hostapd/dnsmasq stack (no `/etc/dnsmasq.conf`, no standalone `dnsmasq.service`, no `hostapd.conf`). This does NOT forbid the `dnsmasq-base` *package* — `nmcli`'s own `ipv4.method shared` invokes that binary internally as its DHCP helper (see the `dnsmasq-base` bullet below); installing it is required, not a violation of this constraint.
 - Mode selection (BLE vs auto-record vs web) happens only at deploy time via which install script is run — no runtime toggle, no two control services active on one Pi simultaneously.
 - Default AP gateway/local IP is `10.42.0.1` (NetworkManager's default for `shared` profiles) — this is the address the web UI is reachable at.
 - Env var config style matches `autostart.sh`/`ble_recorder.py`: `REC_DIR`, `WIDTH`, `HEIGHT`, `FPS`, `BITRATE`, `ENCODER`, `AUTOFOCUS_MODE`, `LENS_POSITION`, `SEGMENT_SEC`, `MAX_FILES`, `SYNC_INTERVAL_SEC`, plus new `AP_SSID`, `AP_PASSWORD`, `AP_IFACE`, `WEB_PORT`.
