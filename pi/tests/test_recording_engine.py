@@ -146,34 +146,80 @@ def test_stop_recording_terminates_pipeline(tmp_path, monkeypatch):
 def test_get_status_idle():
     engine.state.update(
         recording=False, out_path=None, stopping=False, raw=False,
-        last_stop_reason=None,
+        last_stop_reason=None, started_at=None,
     )
-    assert engine.get_status() == {
-        "recording": False, "filename": None, "stopping": False,
-        "raw": False, "last_stop_reason": None,
-    }
+    s = engine.get_status()
+    assert s["recording"] is False
+    assert s["filename"] is None
+    assert s["format"] is None
+    assert s["elapsed_sec"] is None
 
 
-def test_get_status_recording():
+def test_get_status_recording_reports_format_from_file():
     engine.state.update(
         recording=True, out_path="/rec/rec_20260101_000000.mp4", stopping=False,
-        raw=False, last_stop_reason=None,
+        raw=False, last_stop_reason=None, started_at=None,
     )
-    assert engine.get_status() == {
-        "recording": True, "filename": "rec_20260101_000000.mp4",
-        "stopping": False, "raw": False, "last_stop_reason": None,
-    }
+    s = engine.get_status()
+    assert s["filename"] == "rec_20260101_000000.mp4"
+    assert s["format"] == "mp4"
+
+
+def test_get_status_raw_file_reports_raw_format():
+    # Навіть якщо прапорець raw загубився — формат береться з файлу.
+    engine.state.update(
+        recording=True, out_path="/rec/rec_20260101_000000.raw", stopping=False,
+        raw=False, last_stop_reason=None, started_at=None,
+    )
+    assert engine.get_status()["format"] == "raw"
+
+
+def test_get_status_elapsed_counts_up(monkeypatch):
+    monkeypatch.setattr(engine.time, "time", lambda: 1000.0)
+    engine.state.update(
+        recording=True, out_path="/rec/rec_x.mp4", stopping=False, raw=False,
+        last_stop_reason=None, started_at=987.0,
+    )
+    assert engine.get_status()["elapsed_sec"] == 13
+
+
+def test_get_status_raw_supported_false_on_usb(monkeypatch):
+    monkeypatch.setattr(engine, "USE_USB", True)
+    engine.state.update(recording=False, out_path=None, started_at=None)
+    assert engine.get_status()["raw_supported"] is False
 
 
 def test_get_status_stopping():
     engine.state.update(
         recording=True, out_path="/rec/rec_20260101_000000.mp4", stopping=True,
-        raw=False, last_stop_reason=None,
+        raw=False, last_stop_reason=None, started_at=None,
     )
-    assert engine.get_status() == {
-        "recording": True, "filename": "rec_20260101_000000.mp4",
-        "stopping": True, "raw": False, "last_stop_reason": None,
-    }
+    assert engine.get_status()["stopping"] is True
+
+
+def test_capture_snapshot_rejected_while_recording():
+    engine.state.update(recording=True)
+    assert engine.capture_snapshot() is None
+    engine.state.update(recording=False)
+
+
+def test_capture_snapshot_usb_argv_and_returns_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "USE_USB", True)
+    monkeypatch.setattr(engine, "USB_DEVICE", "/dev/video0")
+    monkeypatch.setattr(engine, "USB_INPUT_FORMAT", "mjpeg")
+    monkeypatch.setattr(engine, "SNAPSHOT_PATH", str(tmp_path / ".snapshot.jpg"))
+    engine.state.update(recording=False)
+
+    def fake_run(cmd, **kw):
+        assert cmd[0] == "ffmpeg"
+        assert "-frames:v" in cmd and "1" in cmd
+        assert "/dev/video0" in cmd
+        with open(engine.SNAPSHOT_PATH, "wb") as f:
+            f.write(b"\xff\xd8jpeg")
+        return MagicMock()
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    assert engine.capture_snapshot() == engine.SNAPSHOT_PATH
 
 
 def test_stop_recording_sets_stopping_flag_during_drain(tmp_path, monkeypatch):

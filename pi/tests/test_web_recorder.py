@@ -52,6 +52,28 @@ def test_start_when_already_recording_returns_not_ok(client):
     assert resp.get_json() == {"ok": False}
 
 
+def test_snapshot_ok_calls_engine(client):
+    with patch.object(
+        web_recorder.engine, "capture_snapshot", return_value="/rec/.snapshot.jpg",
+    ) as mock_snap:
+        resp = client.post("/api/snapshot")
+    mock_snap.assert_called_once()
+    assert resp.get_json() == {"ok": True}
+
+
+def test_snapshot_busy_returns_409(client):
+    with patch.object(web_recorder.engine, "capture_snapshot", return_value=None):
+        resp = client.post("/api/snapshot")
+    assert resp.status_code == 409
+    assert resp.get_json()["ok"] is False
+
+
+def test_snapshot_img_404_when_missing(client):
+    with patch.object(web_recorder.os.path, "isfile", return_value=False):
+        resp = client.get("/api/snapshot.jpg")
+    assert resp.status_code == 404
+
+
 def test_files_lists_recordings(client):
     rows = [{"name": "rec_20260101_000000.mp4", "size": 10,
              "created": 1, "status": "saved"}]

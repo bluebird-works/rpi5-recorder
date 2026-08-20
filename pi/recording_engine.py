@@ -76,9 +76,13 @@ state = {
     "recording": False, "cam": None, "ff": None, "stop_event": None,
     "rot_thread": None, "sync_thread": None, "out_path": None,
     "stopping": False, "raw": False, "space_thread": None,
-    "last_stop_reason": None,
+    "last_stop_reason": None, "started_at": None,
 }
 lock = threading.Lock()
+
+# Знімок для перевірки кадру перед записом. Прихований (не .mp4/.raw), тож у
+# список записів не потрапляє.
+SNAPSHOT_PATH = os.path.join(REC_DIR, ".snapshot.jpg")
 
 # Ім'я запису: rec_YYYYMMDD_HHMMSS.mp4 / .raw. Єдиний легальний шаблон —
 # ним же валідуємо download/delete проти path traversal.
@@ -584,7 +588,7 @@ def start_recording(raw=False):
             recording=True, cam=cam, ff=ff, stop_event=stop_event,
             rot_thread=rot_t, sync_thread=sync_t, out_path=out_path,
             stopping=False, raw=raw, space_thread=space_t,
-            last_stop_reason=None,
+            last_stop_reason=None, started_at=time.time(),
         )
         _persist_state(True, raw)
         log.info("REC start raw=%s segments=%ds sync=%ds", raw, SEGMENT_SEC, SYNC_INTERVAL_SEC)
@@ -626,7 +630,7 @@ def stop_recording(reason="manual"):
             recording=False, cam=None, ff=None, stop_event=None,
             rot_thread=None, sync_thread=None, out_path=None,
             stopping=False, raw=False, space_thread=None,
-            last_stop_reason=reason,
+            last_stop_reason=reason, started_at=None,
         )
     _persist_state(False)
     log.info("REC stop reason=%s", reason)
@@ -635,12 +639,59 @@ def stop_recording(reason="manual"):
 
 def get_status():
     with lock:
+        out = state["out_path"]
+        filename = os.path.basename(out) if out else None
+        # Формат — з реального файлу, не з прапорця запиту (USB ігнорує raw).
+        fmt = None
+        if filename:
+            fmt = "raw" if filename.endswith(".raw") else "mp4"
+        elapsed = None
+        if state["recording"] and state["started_at"] is not None:
+            elapsed = int(time.time() - state["started_at"])
         return {
             "recording": state["recording"],
-            "filename": (
-                os.path.basename(state["out_path"]) if state["out_path"] else None
-            ),
+            "filename": filename,
+            "format": fmt,
             "stopping": state["stopping"],
             "raw": state["raw"],
+            # USB завжди H.264 — raw там недоступний, UI ховає чекбокс.
+            "raw_supported": not USE_USB,
+            "elapsed_sec": elapsed,
             "last_stop_reason": state["last_stop_reason"],
         }
+
+
+def capture_snapshot():
+    """Один кадр для перевірки наведення ДО запису. Повертає шлях до JPEG або
+    None. Відмовляє під час запису — камера зайнята одним процесом."""
+    with lock:
+        if state["recording"]:
+            log.warning("snapshot rejected: recording in progress")
+            return None
+    if USE_USB:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+            "-f", "v4l2", "-input_format", USB_INPUT_FORMAT,
+            "-video_size", f"{WIDTH}x{HEIGHT}", "-i", USB_DEVICE,
+            "-frames:v", "1", SNAPSHOT_PATH,
+        ]
+    else:
+        cmd = [
+            "rpicam-jpeg", "-n", "-t", "500",
+            "--width", str(WIDTH), "--height", str(HEIGHT),
+        ]
+        if CAMERA is None or CAMERA["has_autofocus"]:
+            cmd += ["--autofocus-mode", AUTOFOCUS_MODE]
+            if AUTOFOCUS_MODE == "manual":
+                cmd += ["--lens-position", LENS_POSITION]
+        cmd += ["-o", SNAPSHOT_PATH]
+    try:
+        subprocess.run(cmd, check=True, timeout=15,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            FileNotFoundError, OSError) as e:
+        log.warning("snapshot failed: %s", e)
+        return None
+    if os.path.exists(SNAPSHOT_PATH) and os.path.getsize(SNAPSHOT_PATH) > 0:
+        return SNAPSHOT_PATH
+    return None
