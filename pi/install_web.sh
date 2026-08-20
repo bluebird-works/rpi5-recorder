@@ -7,9 +7,27 @@ APP_DIR="${REC_HOME}/rpi5-web"
 SERVICE_NAME="rpi5-web-recorder.service"
 
 AP_SSID="${AP_SSID:-RPiRecorder}"
-AP_PASSWORD="${AP_PASSWORD:-12345678}"
+# Якщо AP_PASSWORD не задано ззовні — генеруємо випадковий 16-символьний
+# пароль (алфанумерика, безпечно в межах WPA-PSK 8-63 символів, без проблем
+# з екрануванням у nmcli). "12345678" публічно в git-репо поруч зі
+# стандартним SSID = будь-хто в радіусі радіо отримує повний контроль над
+# записом.
+AP_PASSWORD="${AP_PASSWORD:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)}"
 AP_IFACE="${AP_IFACE:-wlan0}"
 AP_CON_NAME="rpi-web-ap"
+
+cat <<WARNING >&2
+################################################################################
+# УВАГА: цей скрипт підніме власну WiFi точку доступу (AP) на ${AP_IFACE}.
+# Якщо ти зараз підключена до Pi по SSH саме через ${AP_IFACE} (WiFi-клієнт),
+# ця сесія обірветься ДО того, як зʼявиться підсумкове повідомлення з адресою
+# веб-інтерфейсу — інтерфейс перемкнеться з клієнта на AP просто посеред
+# виконання скрипта.
+#
+# Рекомендація: запускай через Ethernet, серійну консоль, або вкажи інший
+# інтерфейс — AP_IFACE=wlan1 sudo -E bash pi/install_web.sh
+################################################################################
+WARNING
 
 apt-get update
 # dnsmasq-base: без нього ipv4.method=shared не роздає DHCP клієнтам AP.
@@ -17,6 +35,20 @@ apt-get update
 # образі з Install-Recommends=false міг би тихо не встановитись, тому тут
 # явно.
 apt-get install -y ffmpeg rpicam-apps python3-flask network-manager dnsmasq-base
+
+# на свіжому образі wifi-адаптер часто лежить soft-blocked через rfkill,
+# так само як bluetooth в install_ble.sh
+rfkill unblock wifi || true
+
+# nmcli AP-профіль (ipv4.method shared) без regulatory domain може не
+# обрати легальний 2.4GHz канал — `nmcli con up` тоді падає без діагностики
+# в межах досяжності (AP так і не з'явився, SSH вже нема), а systemd-юніт
+# з Restart=always просто крутиться по колу. raspi-config nonint
+# do_wifi_country виставляє regdomain явно; якщо утиліти нема (мінімальний
+# образ) — просто пропускаємо, а не падаємо.
+if command -v raspi-config >/dev/null 2>&1; then
+  raspi-config nonint do_wifi_country "${AP_COUNTRY:-UA}" || true
+fi
 
 # Trixie підняв AP через NetworkManager нативно — hostapd/dnsmasq тут
 # свідомо не піднімаємо (див. спек). Якщо NM не активний — falшивий шлях
@@ -37,17 +69,30 @@ chown -R "${REC_USER}:${REC_USER}" "${APP_DIR}"
 mkdir -p "${REC_HOME}/recordings"
 chown "${REC_USER}:${REC_USER}" "${REC_HOME}/recordings"
 
+# Пароль AP переживає термінальний scrollback — оператору треба його
+# знайти пізніше, а не тільки в момент інсталяції.
+printf '%s\n' "${AP_PASSWORD}" >"${APP_DIR}/.ap_password"
+chmod 600 "${APP_DIR}/.ap_password"
+chown "${REC_USER}:${REC_USER}" "${APP_DIR}/.ap_password"
+
 if ! nmcli -t -f NAME con show | grep -qx "${AP_CON_NAME}"; then
   nmcli con add type wifi ifname "${AP_IFACE}" con-name "${AP_CON_NAME}" \
     ssid "${AP_SSID}" \
     802-11-wireless.mode ap 802-11-wireless.band bg \
     802-11-wireless-security.key-mgmt wpa-psk \
     802-11-wireless-security.psk "${AP_PASSWORD}" \
-    ipv4.method shared connection.autoconnect yes
+    ipv4.method shared ipv4.addresses 10.42.0.1/24 \
+    connection.autoconnect yes
 else
+  # Той самий повний набір властивостей, що й у add-гілці вище — щоб
+  # повторний запуск інсталятора (наприклад з новим AP_PASSWORD) полагодив
+  # і будь-який дрейф mode/band/key-mgmt/ipv4, не тільки ssid/psk.
   nmcli con modify "${AP_CON_NAME}" \
     802-11-wireless.ssid "${AP_SSID}" \
-    802-11-wireless-security.psk "${AP_PASSWORD}"
+    802-11-wireless.mode ap 802-11-wireless.band bg \
+    802-11-wireless-security.key-mgmt wpa-psk \
+    802-11-wireless-security.psk "${AP_PASSWORD}" \
+    ipv4.method shared ipv4.addresses 10.42.0.1/24
 fi
 
 cat >"/etc/systemd/system/${SERVICE_NAME}" <<UNIT
@@ -82,5 +127,10 @@ systemctl daemon-reload
 systemctl enable --now "${SERVICE_NAME}"
 
 systemctl --no-pager status "${SERVICE_NAME}" || true
-echo "web UI: http://10.42.0.1/ (AP ssid=${AP_SSID})"
+echo "=============================================================="
+echo "AP ssid:     ${AP_SSID}"
+echo "AP password: ${AP_PASSWORD}"
+echo "web UI:      http://10.42.0.1/"
+echo "password also saved to: ${APP_DIR}/.ap_password (chmod 600)"
+echo "=============================================================="
 echo "logs: journalctl -u ${SERVICE_NAME} -f"
