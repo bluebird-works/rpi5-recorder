@@ -25,6 +25,8 @@ STATE_DIR="/var/lib/rpi5-web"
 SPOOL_DIR="${STATE_DIR}/spool"
 APPLY_SERVICE="rpi5-ap-apply.service"
 APPLY_PATH="rpi5-ap-apply.path"
+# root-owned шлях виконуваного apply-скрипта (поза pi-writable APP_DIR).
+APPLY_BIN="/usr/local/sbin/rpi5-ap-apply"
 
 cat <<WARNING >&2
 ################################################################################
@@ -75,10 +77,13 @@ usermod -aG video "${REC_USER}" || true
 mkdir -p "${APP_DIR}"
 cp "$(dirname "$0")/recording_engine.py" "${APP_DIR}/"
 cp "$(dirname "$0")/web_recorder.py" "${APP_DIR}/"
-install -m 755 "$(dirname "$0")/ap_apply.sh" "${APP_DIR}/ap_apply.sh"
 chown -R "${REC_USER}:${REC_USER}" "${APP_DIR}"
 mkdir -p "${REC_HOME}/recordings"
 chown "${REC_USER}:${REC_USER}" "${REC_HOME}/recordings"
+
+# ap_apply.sh виконується від root — тому лежить у root-owned теці, НЕ в
+# pi-owned APP_DIR. Інакше pi перезаписав би скрипт і отримав root.
+install -m 755 -o root -g root "$(dirname "$0")/ap_apply.sh" "${APPLY_BIN}"
 
 # State-тека root:root — веб-юзер сюди НЕ пише (тільки читає current-файл),
 # щоб не було symlink-підміни під root-write у ap_apply.sh.
@@ -167,7 +172,7 @@ Type=oneshot
 Environment=AP_CON_NAME=${AP_CON_NAME}
 Environment=AP_SPOOL_FILE=${SPOOL_DIR}/ap-config.json
 Environment=AP_CURRENT_FILE=${STATE_DIR}/ap-current.json
-ExecStart=${APP_DIR}/ap_apply.sh
+ExecStart=${APPLY_BIN}
 UNIT
 
 cat >"/etc/systemd/system/${APPLY_PATH}" <<UNIT
