@@ -66,3 +66,93 @@ def test_rotate_old_files_respects_max_files(tmp_path, monkeypatch):
     engine.rotate_old_files()
     remaining = sorted(os.listdir(tmp_path))
     assert remaining == ["rec_20260101_000100.mp4", "rec_20260101_000200.mp4"]
+
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_engine_state():
+    yield
+    engine.state.update(
+        recording=False, cam=None, ff=None, stop_event=None,
+        rot_thread=None, sync_thread=None, out_path=None,
+    )
+
+
+def _mock_popen_alive():
+    cam = MagicMock()
+    cam.poll.return_value = None
+    cam.stdout = MagicMock()
+    ff = MagicMock()
+    return cam, ff
+
+
+def test_start_recording_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "STATE_FILE", str(tmp_path / ".recording_state"))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "SYNC_INTERVAL_SEC", 0)
+    cam, ff = _mock_popen_alive()
+    with patch.object(engine.subprocess, "Popen", side_effect=[cam, ff]):
+        assert engine.start_recording() is True
+    assert engine.state["recording"] is True
+    assert engine.state["out_path"] is not None
+    assert engine._load_state() == {"active": True}
+    engine.state["stop_event"].set()
+
+
+def test_start_recording_already_recording_returns_false(monkeypatch):
+    engine.state.update(recording=True)
+    assert engine.start_recording() is False
+
+
+def test_start_recording_pipeline_failure_returns_false(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "STATE_FILE", str(tmp_path / ".recording_state"))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    cam = MagicMock()
+    cam.poll.return_value = 1
+    cam.returncode = 1
+    cam.stdout = MagicMock()
+    ff = MagicMock()
+    ff.wait.return_value = None
+    with patch.object(engine.subprocess, "Popen", side_effect=[cam, ff]):
+        assert engine.start_recording() is False
+    assert engine.state["recording"] is False
+
+
+def test_stop_recording_when_not_recording_returns_false():
+    assert engine.stop_recording() is False
+
+
+def test_stop_recording_terminates_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "STATE_FILE", str(tmp_path / ".recording_state"))
+    cam = MagicMock()
+    ff = MagicMock()
+    stop_event = engine.threading.Event()
+    out_path = str(tmp_path / "rec_test.mp4")
+    engine.state.update(
+        recording=True, cam=cam, ff=ff, stop_event=stop_event, out_path=out_path,
+    )
+    assert engine.stop_recording() is True
+    cam.send_signal.assert_called_once_with(engine.signal.SIGTERM)
+    assert engine.state["recording"] is False
+    assert engine.state["out_path"] is None
+    assert engine._load_state() is None
+
+
+def test_get_status_idle():
+    engine.state.update(recording=False, out_path=None)
+    assert engine.get_status() == {"recording": False, "filename": None}
+
+
+def test_get_status_recording():
+    engine.state.update(
+        recording=True, out_path="/rec/rec_20260101_000000.mp4",
+    )
+    assert engine.get_status() == {
+        "recording": True, "filename": "rec_20260101_000000.mp4",
+    }

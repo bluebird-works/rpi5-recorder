@@ -167,3 +167,188 @@ def rotate_old_files():
             log.info("rotated %s", old)
         except OSError as e:
             log.warning("rotate failed for %s: %s", old, e)
+
+
+def _start_pipeline():
+    """rpicam-vid → ffmpeg → mp4. Повертає (cam, ff, out_path) або (None, None, None)."""
+    # Сегмент ріжеться тільки по keyframe, тому GOP = довжині сегмента.
+    intra = FPS * SEGMENT_SEC if SEGMENT_SEC > 0 else FPS
+    cam_cmd = [
+        "rpicam-vid", "-t", "0", "-n",
+        "--width", str(WIDTH), "--height", str(HEIGHT),
+        "--framerate", str(FPS),
+    ]
+    if CAMERA is None or CAMERA["has_autofocus"]:
+        cam_cmd += ["--autofocus-mode", AUTOFOCUS_MODE]
+        if AUTOFOCUS_MODE == "manual":
+            cam_cmd += ["--lens-position", LENS_POSITION]
+
+    # -flush_packets 1: не тримати пакети в user-space буфері ffmpeg, інакше
+    # sync-loop нижче не встигає flushit'и фрагменти в kernel до power-cut.
+    ff_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+        "-flush_packets", "1",
+    ]
+    hardware = _use_hw_encoder(ENCODER)
+    if hardware:
+        cam_cmd += [
+            "--bitrate", str(BITRATE), "--codec", "h264",
+            "--inline", "--intra", str(intra),
+        ]
+        ff_cmd += [
+            "-fflags", "+genpts", "-r", str(FPS), "-f", "h264", "-i", "-",
+            "-c", "copy",
+        ]
+    else:
+        # Софтверний шлях: камера віддає сирий YUV, кодує ffmpeg.
+        cam_cmd += ["--codec", "yuv420"]
+        ff_cmd += [
+            "-f", "rawvideo", "-pix_fmt", "yuv420p",
+            "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS), "-i", "-",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-b:v", str(BITRATE), "-pix_fmt", "yuv420p",
+        ]
+        if SEGMENT_SEC > 0:
+            ff_cmd += [
+                "-flags", "+cgop", "-g", str(intra), "-keyint_min", str(intra),
+                "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SEC})",
+            ]
+    cam_cmd += ["-o", "-"]
+
+    out_path = None
+    if SEGMENT_SEC > 0:
+        ff_cmd += [
+            "-f", "segment", "-segment_time", str(SEGMENT_SEC),
+            "-segment_format", "mp4",
+            "-segment_format_options", f"movflags={FRAG_FLAGS}",
+            "-reset_timestamps", "1", "-strftime", "1",
+            os.path.join(REC_DIR, "rec_%Y%m%d_%H%M%S.mp4"),
+        ]
+    else:
+        out_path = os.path.join(REC_DIR, time.strftime("rec_%Y%m%d_%H%M%S.mp4"))
+        ff_cmd += ["-movflags", FRAG_FLAGS, "-f", "mp4", out_path]
+
+    cam = subprocess.Popen(cam_cmd, stdout=subprocess.PIPE)
+    ff = subprocess.Popen(ff_cmd, stdin=cam.stdout)
+    cam.stdout.close()
+
+    # Чекаємо подію (процес помер / перші байти в mp4), не фіксовану паузу —
+    # велика роздільність ініціалізується довше, ніж 0.5с.
+    deadline = time.monotonic() + PIPELINE_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if cam.poll() is not None:
+            break
+        if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            break
+        time.sleep(0.1)
+    if cam.poll() is not None:
+        log.error("rpicam-vid exited at start with code %s", cam.returncode)
+        try:
+            ff.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            ff.terminate()
+            try:
+                ff.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                ff.kill()
+        if out_path and os.path.exists(out_path):
+            try:
+                if os.path.getsize(out_path) == 0:
+                    os.remove(out_path)
+                    log.info("removed empty %s", os.path.basename(out_path))
+            except OSError:
+                pass
+        return None, None, None
+
+    log.info(
+        "pipeline start %dx%d@%d br=%d encoder=%s",
+        WIDTH, HEIGHT, FPS, BITRATE, "hardware" if hardware else "software",
+    )
+    return cam, ff, out_path
+
+
+def _rotator_loop(stop_event):
+    while not stop_event.wait(30):
+        rotate_old_files()
+
+
+def _sync_loop(stop_event):
+    # os.sync() глобальний, але цінніше — обмежити втрату при power-cut до
+    # SYNC_INTERVAL_SEC секунд відео.
+    while not stop_event.wait(SYNC_INTERVAL_SEC):
+        try:
+            os.sync()
+        except OSError as e:
+            log.warning("sync failed: %s", e)
+
+
+def start_recording():
+    with lock:
+        if state["recording"]:
+            return False
+        rotate_old_files()
+        cam, ff, out_path = _start_pipeline()
+        if cam is None:
+            log.warning("REC start failed")
+            return False
+        stop_event = threading.Event()
+        rot_t = threading.Thread(target=_rotator_loop, args=(stop_event,), daemon=True)
+        rot_t.start()
+        sync_t = None
+        if SYNC_INTERVAL_SEC > 0:
+            sync_t = threading.Thread(target=_sync_loop, args=(stop_event,), daemon=True)
+            sync_t.start()
+        state.update(
+            recording=True, cam=cam, ff=ff, stop_event=stop_event,
+            rot_thread=rot_t, sync_thread=sync_t, out_path=out_path,
+        )
+        _persist_state(True)
+        log.info("REC start segments=%ds sync=%ds", SEGMENT_SEC, SYNC_INTERVAL_SEC)
+        return True
+
+
+def stop_recording():
+    with lock:
+        if not state["recording"]:
+            return False
+        cam = state["cam"]
+        ff = state["ff"]
+        stop_event = state["stop_event"]
+    stop_event.set()
+    # Валимо тільки камеру: ffmpeg бачить EOF, дописує moov і виходить сам.
+    if cam:
+        cam.send_signal(signal.SIGTERM)
+        try:
+            cam.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            cam.kill()
+            cam.wait(timeout=5)
+    if ff:
+        try:
+            ff.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            log.warning("ffmpeg hung after EOF, killing")
+            ff.kill()
+            ff.wait(timeout=5)
+    try:
+        os.sync()
+    except OSError as e:
+        log.warning("final sync failed: %s", e)
+    with lock:
+        state.update(
+            recording=False, cam=None, ff=None, stop_event=None,
+            rot_thread=None, sync_thread=None, out_path=None,
+        )
+    _persist_state(False)
+    log.info("REC stop")
+    return True
+
+
+def get_status():
+    with lock:
+        return {
+            "recording": state["recording"],
+            "filename": (
+                os.path.basename(state["out_path"]) if state["out_path"] else None
+            ),
+        }
