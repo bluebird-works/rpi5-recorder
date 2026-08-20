@@ -350,6 +350,7 @@ def test_start_usb_pipeline_argv(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "FPS", 30)
     monkeypatch.setattr(engine, "USB_DEVICE", "/dev/video0")
     monkeypatch.setattr(engine, "USB_INPUT_FORMAT", "mjpeg")
+    monkeypatch.setattr(engine, "USB_ENCODER", "libx264")
     proc = MagicMock()
     proc.poll.return_value = None
     with patch.object(engine.subprocess, "Popen", return_value=proc) as mock_popen:
@@ -364,6 +365,21 @@ def test_start_usb_pipeline_argv(tmp_path, monkeypatch):
     assert "/dev/video0" in argv
     assert "libx264" in argv
     assert "1920x1080" in argv
+
+
+def test_start_usb_pipeline_copy_encoder(tmp_path, monkeypatch):
+    # copy-режим (для слабких Pi): нативний потік, без -b:v/-pix_fmt.
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "USB_ENCODER", "copy")
+    proc = MagicMock()
+    proc.poll.return_value = None
+    with patch.object(engine.subprocess, "Popen", return_value=proc) as mock_popen:
+        engine._start_usb_pipeline()
+    argv = mock_popen.call_args_list[0].args[0]
+    assert "-c" in argv and "copy" in argv
+    assert "libx264" not in argv
+    assert "-b:v" not in argv
 
 
 def test_use_usb_defaults_false(monkeypatch):

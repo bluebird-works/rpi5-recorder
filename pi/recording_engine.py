@@ -43,6 +43,10 @@ USB_DEVICE = os.environ.get("USB_DEVICE", "/dev/video0")
 # USB UVC-камери майже завжди дають MJPEG (компресований, влазить у USB2 bus);
 # YUYV на 1080p не влазить у bandwidth. ffmpeg декодує MJPEG і кодує в H.264.
 USB_INPUT_FORMAT = os.environ.get("USB_INPUT_FORMAT", "mjpeg")
+# Енкодер для USB-шляху. libx264 не тягне 1080p на слабких Pi (Pi 3 захлинається
+# і кладе мережу через спільну USB/Ethernet шину). h264_v4l2m2m — апаратний,
+# майже не жере CPU. Дефолт HW; libx264 як явний fallback (USB_ENCODER=libx264).
+USB_ENCODER = os.environ.get("USB_ENCODER", "h264_v4l2m2m")
 USE_USB = CAMERA_SRC == "usb"
 # Нижче цього порогу вільного місця raw-запис зупиняється сам і зберігає вже
 # зняте. H.264 натомість іде кільцевою ротацією (rotate_old_files), бо його
@@ -397,9 +401,18 @@ def _start_usb_pipeline():
         "-f", "v4l2", "-input_format", USB_INPUT_FORMAT,
         "-framerate", str(FPS), "-video_size", f"{WIDTH}x{HEIGHT}",
         "-i", USB_DEVICE,
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-b:v", str(BITRATE), "-pix_fmt", "yuv420p",
     ]
+    if USB_ENCODER == "copy":
+        # Нативний потік камери (MJPEG) без транскоду — нуль CPU, нуль
+        # залежності від HW-енкодера. Рятунок для слабких Pi (Pi 3), де
+        # h264_v4l2m2m зависає, а libx264 не тягне 1080p. Файл більший.
+        cmd += ["-c", "copy"]
+    elif USB_ENCODER == "libx264":
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast",
+                "-b:v", str(BITRATE), "-pix_fmt", "yuv420p"]
+    else:
+        # h264_v4l2m2m (апаратний): CPU майже вільний, де він працює.
+        cmd += ["-c:v", USB_ENCODER, "-b:v", str(BITRATE), "-pix_fmt", "yuv420p"]
     out_path = None
     if SEGMENT_SEC > 0:
         cmd += [
@@ -433,8 +446,8 @@ def _start_usb_pipeline():
                 pass
         return None, None, None
 
-    log.info("usb pipeline start %dx%d@%d br=%d dev=%s fmt=%s",
-             WIDTH, HEIGHT, FPS, BITRATE, USB_DEVICE, USB_INPUT_FORMAT)
+    log.info("usb pipeline start %dx%d@%d br=%d dev=%s fmt=%s enc=%s",
+             WIDTH, HEIGHT, FPS, BITRATE, USB_DEVICE, USB_INPUT_FORMAT, USB_ENCODER)
     return proc, None, out_path
 
 
