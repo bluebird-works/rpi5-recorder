@@ -146,6 +146,7 @@ Environment=AUTOFOCUS_MODE=manual LENS_POSITION=0
 Environment=SEGMENT_SEC=0
 Environment=WEB_PORT=80
 Environment=RAW_FPS=10 FREE_MB_MIN=500
+Environment=CAMERA_SRC=${CAMERA_SRC:-csi} USB_DEVICE=${USB_DEVICE:-/dev/video0}
 Environment=AP_CURRENT_FILE=${STATE_DIR}/ap-current.json
 Environment=AP_SPOOL_FILE=${SPOOL_DIR}/ap-config.json
 # слухати порт 80 без рута — той самий принцип найменших прав, що в BLE-юніті

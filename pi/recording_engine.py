@@ -35,6 +35,15 @@ PIPELINE_START_TIMEOUT = float(os.environ.get("PIPELINE_START_TIMEOUT", 3))
 # їсть диск на два порядки швидше за H.264 — тому окрема, нижча дефолтна
 # частота, не перевикористання FPS=30.
 RAW_FPS = int(os.environ.get("RAW_FPS", 10))
+# Джерело камери. "csi" (дефолт) — CSI через rpicam, канон проєкту. "usb" —
+# UVC-камера через V4L2 напряму в ffmpeg (окреме залізо, де CSI нема).
+# Свідомо явний вибір на деплої, не авто, щоб не чіпати CSI-шлях і тести.
+CAMERA_SRC = os.environ.get("CAMERA_SRC", "csi")
+USB_DEVICE = os.environ.get("USB_DEVICE", "/dev/video0")
+# USB UVC-камери майже завжди дають MJPEG (компресований, влазить у USB2 bus);
+# YUYV на 1080p не влазить у bandwidth. ffmpeg декодує MJPEG і кодує в H.264.
+USB_INPUT_FORMAT = os.environ.get("USB_INPUT_FORMAT", "mjpeg")
+USE_USB = CAMERA_SRC == "usb"
 # Нижче цього порогу вільного місця raw-запис зупиняється сам і зберігає вже
 # зняте. H.264 натомість іде кільцевою ротацією (rotate_old_files), бо його
 # бітрейт передбачуваний — raw же може прибити карту за хвилини.
@@ -377,6 +386,58 @@ def _start_pipeline():
     return cam, ff, out_path
 
 
+def _start_usb_pipeline():
+    """USB UVC-камера через V4L2 напряму в ffmpeg (один процес, без rpicam).
+    Повертає (proc, None, out_path) — proc це ffmpeg, займає слот 'cam' у стані
+    (той самий SIGTERM-стоп що й для CSI). Підтримує сегменти як software-CSI."""
+    intra = FPS * SEGMENT_SEC if SEGMENT_SEC > 0 else FPS
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+        "-flush_packets", "1",
+        "-f", "v4l2", "-input_format", USB_INPUT_FORMAT,
+        "-framerate", str(FPS), "-video_size", f"{WIDTH}x{HEIGHT}",
+        "-i", USB_DEVICE,
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-b:v", str(BITRATE), "-pix_fmt", "yuv420p",
+    ]
+    out_path = None
+    if SEGMENT_SEC > 0:
+        cmd += [
+            "-flags", "+cgop", "-g", str(intra), "-keyint_min", str(intra),
+            "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SEC})",
+            "-f", "segment", "-segment_time", str(SEGMENT_SEC),
+            "-segment_format", "mp4",
+            "-segment_format_options", f"movflags={FRAG_FLAGS}",
+            "-reset_timestamps", "1", "-strftime", "1",
+            os.path.join(REC_DIR, "rec_%Y%m%d_%H%M%S.mp4"),
+        ]
+    else:
+        out_path = os.path.join(REC_DIR, time.strftime("rec_%Y%m%d_%H%M%S.mp4"))
+        cmd += ["-movflags", FRAG_FLAGS, "-f", "mp4", out_path]
+
+    proc = subprocess.Popen(cmd)
+    deadline = time.monotonic() + PIPELINE_START_TIMEOUT
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            break
+        time.sleep(0.1)
+    if proc.poll() is not None:
+        log.error("ffmpeg(usb) exited at start with code %s", proc.returncode)
+        if out_path and os.path.exists(out_path):
+            try:
+                if os.path.getsize(out_path) == 0:
+                    os.remove(out_path)
+            except OSError:
+                pass
+        return None, None, None
+
+    log.info("usb pipeline start %dx%d@%d br=%d dev=%s fmt=%s",
+             WIDTH, HEIGHT, FPS, BITRATE, USB_DEVICE, USB_INPUT_FORMAT)
+    return proc, None, out_path
+
+
 def _start_raw_pipeline():
     """rpicam-raw → сирий Bayer прямо у файл, БЕЗ ffmpeg (headerless потік,
     муксити нема що). Повертає (cam, None, out_path) або (None, None, None).
@@ -481,7 +542,15 @@ def start_recording(raw=False):
         if state["recording"]:
             return False
         rotate_old_files()
-        cam, ff, out_path = _start_raw_pipeline() if raw else _start_pipeline()
+        # USB ігнорує raw (rpicam-raw до UVC не застосовний) — завжди H.264,
+        # тож і watchdog вільного місця (нижче, if raw) не потрібен.
+        if USE_USB:
+            raw = False
+            cam, ff, out_path = _start_usb_pipeline()
+        elif raw:
+            cam, ff, out_path = _start_raw_pipeline()
+        else:
+            cam, ff, out_path = _start_pipeline()
         if cam is None:
             log.warning("REC start failed (raw=%s)", raw)
             return False

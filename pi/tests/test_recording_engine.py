@@ -342,6 +342,35 @@ def test_start_raw_pipeline_argv_and_sidecar(tmp_path, monkeypatch):
     assert meta["fps"] == 10
 
 
+def test_start_usb_pipeline_argv(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "WIDTH", 1920)
+    monkeypatch.setattr(engine, "HEIGHT", 1080)
+    monkeypatch.setattr(engine, "FPS", 30)
+    monkeypatch.setattr(engine, "USB_DEVICE", "/dev/video0")
+    monkeypatch.setattr(engine, "USB_INPUT_FORMAT", "mjpeg")
+    proc = MagicMock()
+    proc.poll.return_value = None
+    with patch.object(engine.subprocess, "Popen", return_value=proc) as mock_popen:
+        cam_out, ff_out, out_path = engine._start_usb_pipeline()
+    assert cam_out is proc
+    assert ff_out is None
+    assert out_path.endswith(".mp4")
+    argv = mock_popen.call_args_list[0].args[0]
+    assert argv[0] == "ffmpeg"
+    assert "-f" in argv and "v4l2" in argv
+    assert "-input_format" in argv and "mjpeg" in argv
+    assert "/dev/video0" in argv
+    assert "libx264" in argv
+    assert "1920x1080" in argv
+
+
+def test_use_usb_defaults_false(monkeypatch):
+    # Дефолт CAMERA_SRC=csi → USB вимкнено, CSI-шлях і тести не зачеплені.
+    assert engine.USE_USB is False
+
+
 def test_space_watchdog_stops_on_low_space(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
     monkeypatch.setattr(engine, "FREE_MB_MIN", 500)
