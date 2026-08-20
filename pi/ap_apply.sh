@@ -8,10 +8,19 @@
 set -euo pipefail
 
 AP_CON_NAME="${AP_CON_NAME:-rpi-web-ap}"
-AP_SPOOL_FILE="${AP_SPOOL_FILE:-/var/lib/rpi5-web/ap-config.json}"
-AP_CURRENT_FILE="${AP_CURRENT_FILE:-/home/pi/rpi5-web/ap-current.json}"
-CURRENT_OWNER="${CURRENT_OWNER:-pi}"
+AP_SPOOL_FILE="${AP_SPOOL_FILE:-/var/lib/rpi5-web/spool/ap-config.json}"
+# ВАЖЛИВО: current-файл МУСИТЬ бути в root-only теці, куди веб-юзер не має
+# write. Інакше pi підмінює його симлінком на root-owned файл, і наші
+# `printf >` / (колишній) chown стають root-write/chown primitive = LPE.
+AP_CURRENT_FILE="${AP_CURRENT_FILE:-/var/lib/rpi5-web/ap-current.json}"
 
+# Spool пише непривілейований процес — не йдемо за симлінком (pi міг би
+# націлити його на root-файл, щоб root прочитав чуже).
+if [ -L "${AP_SPOOL_FILE}" ]; then
+  echo "ap_apply: spool is a symlink, refusing" >&2
+  rm -f "${AP_SPOOL_FILE}"
+  exit 1
+fi
 [ -f "${AP_SPOOL_FILE}" ] || exit 0
 
 # jq відсутній у мінімальному образі — тягнемо поля python'ом (він завжди є).
@@ -41,11 +50,11 @@ nmcli con modify "${AP_CON_NAME}" \
 
 # Оновлюємо current-файл (звідки веб читає для показу), потім піднімаємо
 # профіль наново — це РОЗІРВЕ активні підключення клієнтів, очікувано.
-CUR_DIR="$(dirname "${AP_CURRENT_FILE}")"
-mkdir -p "${CUR_DIR}"
+# Файл лишається root:root (веб-юзер тільки читає) — навмисно НЕ chown-имо
+# на pi: тека root-only, а chown по шляху, який pi не контролює, все одно
+# зайвий. 644 достатньо для читання вебом.
 printf '{"ssid": "%s", "password": "%s"}\n' "${SSID}" "${PSK}" >"${AP_CURRENT_FILE}"
-chown "${CURRENT_OWNER}:${CURRENT_OWNER}" "${AP_CURRENT_FILE}" || true
-chmod 600 "${AP_CURRENT_FILE}"
+chmod 644 "${AP_CURRENT_FILE}"
 
 # Spool спожито — прибираємо, щоб path-юніт не зациклився.
 rm -f "${AP_SPOOL_FILE}"

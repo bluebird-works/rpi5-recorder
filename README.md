@@ -258,7 +258,7 @@ scp pi@10.42.0.1:~/recordings/*.mp4 ./
 
 Внизу сторінки — форма зміни SSID/пароля (на випадок кількох рекордерів на одній локації). Після збереження **поточне підключення до AP розірветься** — браузер треба буде перепідключити до нової мережі; сторінка попереджає про це перед застосуванням. Валідація: SSID 1–32, пароль 8–63 друкованих ASCII.
 
-Веб-сервіс сам прав на `nmcli` не має (крутиться під `${REC_USER}`, тільки `CAP_NET_BIND_SERVICE`). Він лише пише бажаний конфіг у spool `/var/lib/rpi5-web/ap-config.json`; окремий root-owned systemd path-юніт (`rpi5-ap-apply.path` → `ap_apply.sh`) бачить зміну, **перевіряє все заново** і застосовує через `nmcli con modify`. Ніякого sudo/setuid/polkit — привілеї не течуть у веб-процес.
+Веб-сервіс сам прав на `nmcli` не має (крутиться під `${REC_USER}`, тільки `CAP_NET_BIND_SERVICE`). Він лише пише бажаний конфіг у spool `/var/lib/rpi5-web/spool/ap-config.json` (pi-writable підтека); окремий root-owned systemd path-юніт (`rpi5-ap-apply.path` → `ap_apply.sh`) бачить зміну, **перевіряє все заново** і застосовує через `nmcli con modify`. Ніякого sudo/setuid/polkit — привілеї не течуть у веб-процес. Поточний стан AP root пише в `/var/lib/rpi5-web/ap-current.json` (root-only тека, pi лише читає) — навмисно окремо від spool, щоб pi не міг підмінити його симлінком і перетворити root-write на escalation.
 
 ### Raw-data режим
 

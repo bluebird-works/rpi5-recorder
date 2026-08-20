@@ -16,9 +16,13 @@ AP_SSID="${AP_SSID:-RPiRecorder}"
 AP_PASSWORD="${AP_PASSWORD:-12345678}"
 AP_IFACE="${AP_IFACE:-wlan0}"
 AP_CON_NAME="rpi-web-ap"
-# Spool-тека для privilege-separated rename AP: веб (непривілейований) кладе
-# бажаний конфіг сюди, root-вотчер (ap_apply.sh) забирає й застосовує.
-SPOOL_DIR="/var/lib/rpi5-web"
+# Privilege-separated rename AP. Дві теки з РІЗНИМИ правами навмисно:
+#   STATE_DIR (root:root 755) — root пише сюди ap-current.json, pi лише читає.
+#     Якби pi мав тут write, він підмінив би файл симлінком на root-owned
+#     ціль і перетворив root-write у LPE.
+#   SPOOL_DIR (root:pi 770)   — pi пише сюди бажаний конфіг, root забирає.
+STATE_DIR="/var/lib/rpi5-web"
+SPOOL_DIR="${STATE_DIR}/spool"
 APPLY_SERVICE="rpi5-ap-apply.service"
 APPLY_PATH="rpi5-ap-apply.path"
 
@@ -76,16 +80,23 @@ chown -R "${REC_USER}:${REC_USER}" "${APP_DIR}"
 mkdir -p "${REC_HOME}/recordings"
 chown "${REC_USER}:${REC_USER}" "${REC_HOME}/recordings"
 
-# Spool-тека: root володіє, веб-юзер має право писати (кладе бажаний конфіг).
+# State-тека root:root — веб-юзер сюди НЕ пише (тільки читає current-файл),
+# щоб не було symlink-підміни під root-write у ap_apply.sh.
+mkdir -p "${STATE_DIR}"
+chown root:root "${STATE_DIR}"
+chmod 755 "${STATE_DIR}"
+
+# Spool-підтека: root володіє, веб-юзер (група) має право писати.
 mkdir -p "${SPOOL_DIR}"
 chown "root:${REC_USER}" "${SPOOL_DIR}"
 chmod 770 "${SPOOL_DIR}"
 
 # Поточний стан AP (для показу у веб-UI) — сідуємо тим, що ставимо зараз.
+# root:root 644: pi читає, але не може підмінити (тека root-only).
 printf '{"ssid": "%s", "password": "%s"}\n' "${AP_SSID}" "${AP_PASSWORD}" \
-  >"${APP_DIR}/ap-current.json"
-chmod 600 "${APP_DIR}/ap-current.json"
-chown "${REC_USER}:${REC_USER}" "${APP_DIR}/ap-current.json"
+  >"${STATE_DIR}/ap-current.json"
+chown root:root "${STATE_DIR}/ap-current.json"
+chmod 644 "${STATE_DIR}/ap-current.json"
 
 # Пароль AP переживає термінальний scrollback — оператору треба його
 # знайти пізніше, а не тільки в момент інсталяції.
@@ -130,7 +141,7 @@ Environment=AUTOFOCUS_MODE=manual LENS_POSITION=0
 Environment=SEGMENT_SEC=0
 Environment=WEB_PORT=80
 Environment=RAW_FPS=10 FREE_MB_MIN=500
-Environment=AP_CURRENT_FILE=${APP_DIR}/ap-current.json
+Environment=AP_CURRENT_FILE=${STATE_DIR}/ap-current.json
 Environment=AP_SPOOL_FILE=${SPOOL_DIR}/ap-config.json
 # слухати порт 80 без рута — той самий принцип найменших прав, що в BLE-юніті
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -155,8 +166,7 @@ After=NetworkManager.service
 Type=oneshot
 Environment=AP_CON_NAME=${AP_CON_NAME}
 Environment=AP_SPOOL_FILE=${SPOOL_DIR}/ap-config.json
-Environment=AP_CURRENT_FILE=${APP_DIR}/ap-current.json
-Environment=CURRENT_OWNER=${REC_USER}
+Environment=AP_CURRENT_FILE=${STATE_DIR}/ap-current.json
 ExecStart=${APP_DIR}/ap_apply.sh
 UNIT
 

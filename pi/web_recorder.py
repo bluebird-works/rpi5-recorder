@@ -19,12 +19,14 @@ from flask import Flask, jsonify, request, send_file
 import recording_engine as engine
 
 WEB_PORT = int(os.environ.get("WEB_PORT", 80))
-# Поточний стан AP (SSID/пароль), пише root-вотчер, читає веб. Дефолт — поряд
-# з кодом у деплой-теці.
+# Поточний стан AP (SSID/пароль): пише root-вотчер у root-only теку, веб лише
+# читає. НЕ в APP_DIR — інакше pi підмінив би файл симлінком (див. ap_apply.sh).
 AP_CURRENT_FILE = os.environ.get(
-    "AP_CURRENT_FILE", os.path.expanduser("~/rpi5-web/ap-current.json"))
-# Spool: сюди веб кладе бажаний конфіг, звідси root-вотчер його забирає.
-AP_SPOOL_FILE = os.environ.get("AP_SPOOL_FILE", "/var/lib/rpi5-web/ap-config.json")
+    "AP_CURRENT_FILE", "/var/lib/rpi5-web/ap-current.json")
+# Spool: сюди веб (pi-writable підтека) кладе бажаний конфіг, звідси root-вотчер
+# його забирає.
+AP_SPOOL_FILE = os.environ.get(
+    "AP_SPOOL_FILE", "/var/lib/rpi5-web/spool/ap-config.json")
 
 # WPA2-PSK: 8..63 друкованих ASCII. SSID: 1..32 байти. Валідація дублює те, що
 # root-вотчер робить ще раз — spool пише непривілейований процес, довіри нема.
