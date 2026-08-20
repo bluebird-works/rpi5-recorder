@@ -31,7 +31,9 @@ def test_use_hw_encoder_auto_no_hw_node(tmp_path):
 def test_persist_and_load_state_round_trip(tmp_path, monkeypatch):
     monkeypatch.setattr(engine, "STATE_FILE", str(tmp_path / ".recording_state"))
     engine._persist_state(True)
-    assert engine._load_state() == {"active": True}
+    assert engine._load_state() == {"active": True, "raw": False}
+    engine._persist_state(True, raw=True)
+    assert engine._load_state() == {"active": True, "raw": True}
     engine._persist_state(False)
     assert engine._load_state() is None
 
@@ -97,7 +99,7 @@ def test_start_recording_success(tmp_path, monkeypatch):
         assert engine.start_recording() is True
     assert engine.state["recording"] is True
     assert engine.state["out_path"] is not None
-    assert engine._load_state() == {"active": True}
+    assert engine._load_state() == {"active": True, "raw": False}
     engine.state["stop_event"].set()
 
 
@@ -142,29 +144,35 @@ def test_stop_recording_terminates_pipeline(tmp_path, monkeypatch):
 
 
 def test_get_status_idle():
-    engine.state.update(recording=False, out_path=None, stopping=False)
+    engine.state.update(
+        recording=False, out_path=None, stopping=False, raw=False,
+        last_stop_reason=None,
+    )
     assert engine.get_status() == {
         "recording": False, "filename": None, "stopping": False,
+        "raw": False, "last_stop_reason": None,
     }
 
 
 def test_get_status_recording():
     engine.state.update(
         recording=True, out_path="/rec/rec_20260101_000000.mp4", stopping=False,
+        raw=False, last_stop_reason=None,
     )
     assert engine.get_status() == {
         "recording": True, "filename": "rec_20260101_000000.mp4",
-        "stopping": False,
+        "stopping": False, "raw": False, "last_stop_reason": None,
     }
 
 
 def test_get_status_stopping():
     engine.state.update(
         recording=True, out_path="/rec/rec_20260101_000000.mp4", stopping=True,
+        raw=False, last_stop_reason=None,
     )
     assert engine.get_status() == {
         "recording": True, "filename": "rec_20260101_000000.mp4",
-        "stopping": True,
+        "stopping": True, "raw": False, "last_stop_reason": None,
     }
 
 
@@ -241,3 +249,111 @@ def test_start_pipeline_software_branch_argv_with_segments(tmp_path, monkeypatch
     assert "ffmpeg" in ff_argv
     assert "-f" in ff_argv and "segment" in ff_argv
     assert "-force_key_frames" in ff_argv
+
+
+# --- Part 4/5: file table, delete, raw ---------------------------------------
+
+
+def _touch(path, size=10):
+    with open(path, "wb") as f:
+        f.write(b"x" * size)
+
+
+def test_list_recordings_reports_status_and_both_exts(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    _touch(tmp_path / "rec_20260101_000000.mp4")
+    _touch(tmp_path / "rec_20260101_000100.raw")
+    (tmp_path / "rec_20260101_000100.json").write_text("{}")  # sidecar, hidden
+    (tmp_path / "notes.txt").write_text("nope")
+    engine.state.update(out_path=str(tmp_path / "rec_20260101_000100.raw"))
+    rows = engine.list_recordings()
+    engine.state.update(out_path=None)
+    names = [r["name"] for r in rows]
+    assert names == ["rec_20260101_000100.raw", "rec_20260101_000000.mp4"]
+    assert "rec_20260101_000100.json" not in names
+    assert "notes.txt" not in names
+    active = next(r for r in rows if r["name"] == "rec_20260101_000100.raw")
+    saved = next(r for r in rows if r["name"] == "rec_20260101_000000.mp4")
+    assert active["status"] == "recording"
+    assert saved["status"] == "saved"
+    assert saved["size"] == 10
+
+
+def test_safe_rec_path_rejects_traversal(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    assert engine._safe_rec_path("../../etc/passwd") is None
+    assert engine._safe_rec_path("rec_20260101_000000.mp4/../../x") is None
+    assert engine._safe_rec_path("evil.sh") is None
+    assert engine._safe_rec_path("rec_bad.mp4") is None
+    _touch(tmp_path / "rec_20260101_000000.mp4")
+    ok = engine._safe_rec_path("rec_20260101_000000.mp4")
+    assert ok == os.path.realpath(str(tmp_path / "rec_20260101_000000.mp4"))
+
+
+def test_delete_recording_removes_file_and_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    engine.state.update(out_path=None)
+    _touch(tmp_path / "rec_20260101_000000.raw")
+    (tmp_path / "rec_20260101_000000.json").write_text("{}")
+    assert engine.delete_recording("rec_20260101_000000.raw") is True
+    assert not (tmp_path / "rec_20260101_000000.raw").exists()
+    assert not (tmp_path / "rec_20260101_000000.json").exists()
+
+
+def test_delete_recording_refuses_active(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    _touch(tmp_path / "rec_20260101_000000.mp4")
+    engine.state.update(out_path=str(tmp_path / "rec_20260101_000000.mp4"))
+    assert engine.delete_recording("rec_20260101_000000.mp4") is False
+    engine.state.update(out_path=None)
+    assert (tmp_path / "rec_20260101_000000.mp4").exists()
+
+
+def test_delete_recording_rejects_bad_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    assert engine.delete_recording("../../etc/passwd") is False
+
+
+def test_start_raw_pipeline_argv_and_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "RAW_FPS", 10)
+    monkeypatch.setattr(
+        engine, "CAMERA",
+        {"sensor": "imx708", "has_autofocus": True, "bit_depth": 10,
+         "bayer_order": "RGGB", "max_width": 4608, "max_height": 2592},
+    )
+    cam = MagicMock()
+    cam.poll.return_value = None
+    with patch.object(engine.subprocess, "Popen", return_value=cam) as mock_popen:
+        cam_out, ff_out, out_path = engine._start_raw_pipeline()
+    assert cam_out is cam
+    assert ff_out is None
+    assert out_path.endswith(".raw")
+    cam_argv = mock_popen.call_args_list[0].args[0]
+    assert "rpicam-raw" in cam_argv
+    assert "--framerate" in cam_argv and "10" in cam_argv
+    sidecar = engine._sidecar_path(out_path)
+    assert os.path.exists(sidecar)
+    import json as _json
+    meta = _json.loads(open(sidecar).read())
+    assert meta["sensor"] == "imx708"
+    assert meta["bit_depth"] == 10
+    assert meta["fps"] == 10
+
+
+def test_space_watchdog_stops_on_low_space(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "FREE_MB_MIN", 500)
+    monkeypatch.setattr(engine, "SYNC_INTERVAL_SEC", 0)
+    calls = []
+    monkeypatch.setattr(engine, "stop_recording", lambda reason: calls.append(reason))
+
+    class FakeVfs:
+        f_bavail = 10
+        f_frsize = 1024 * 1024  # 10 MB free, below 500
+
+    monkeypatch.setattr(engine.os, "statvfs", lambda p: FakeVfs())
+    ev = engine.threading.Event()
+    engine._space_watchdog_loop(ev)
+    assert calls == ["low_space"]

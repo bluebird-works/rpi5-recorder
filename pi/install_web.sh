@@ -16,6 +16,11 @@ AP_SSID="${AP_SSID:-RPiRecorder}"
 AP_PASSWORD="${AP_PASSWORD:-12345678}"
 AP_IFACE="${AP_IFACE:-wlan0}"
 AP_CON_NAME="rpi-web-ap"
+# Spool-тека для privilege-separated rename AP: веб (непривілейований) кладе
+# бажаний конфіг сюди, root-вотчер (ap_apply.sh) забирає й застосовує.
+SPOOL_DIR="/var/lib/rpi5-web"
+APPLY_SERVICE="rpi5-ap-apply.service"
+APPLY_PATH="rpi5-ap-apply.path"
 
 cat <<WARNING >&2
 ################################################################################
@@ -66,9 +71,21 @@ usermod -aG video "${REC_USER}" || true
 mkdir -p "${APP_DIR}"
 cp "$(dirname "$0")/recording_engine.py" "${APP_DIR}/"
 cp "$(dirname "$0")/web_recorder.py" "${APP_DIR}/"
+install -m 755 "$(dirname "$0")/ap_apply.sh" "${APP_DIR}/ap_apply.sh"
 chown -R "${REC_USER}:${REC_USER}" "${APP_DIR}"
 mkdir -p "${REC_HOME}/recordings"
 chown "${REC_USER}:${REC_USER}" "${REC_HOME}/recordings"
+
+# Spool-тека: root володіє, веб-юзер має право писати (кладе бажаний конфіг).
+mkdir -p "${SPOOL_DIR}"
+chown "root:${REC_USER}" "${SPOOL_DIR}"
+chmod 770 "${SPOOL_DIR}"
+
+# Поточний стан AP (для показу у веб-UI) — сідуємо тим, що ставимо зараз.
+printf '{"ssid": "%s", "password": "%s"}\n' "${AP_SSID}" "${AP_PASSWORD}" \
+  >"${APP_DIR}/ap-current.json"
+chmod 600 "${APP_DIR}/ap-current.json"
+chown "${REC_USER}:${REC_USER}" "${APP_DIR}/ap-current.json"
 
 # Пароль AP переживає термінальний scrollback — оператору треба його
 # знайти пізніше, а не тільки в момент інсталяції.
@@ -112,6 +129,9 @@ Environment=WIDTH=1920 HEIGHT=1080 FPS=30 BITRATE=10000000
 Environment=AUTOFOCUS_MODE=manual LENS_POSITION=0
 Environment=SEGMENT_SEC=0
 Environment=WEB_PORT=80
+Environment=RAW_FPS=10 FREE_MB_MIN=500
+Environment=AP_CURRENT_FILE=${APP_DIR}/ap-current.json
+Environment=AP_SPOOL_FILE=${SPOOL_DIR}/ap-config.json
 # слухати порт 80 без рута — той самий принцип найменших прав, що в BLE-юніті
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -124,7 +144,36 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
 
+# Root-вотчер rename AP: path-юніт стежить за spool-файлом, service його
+# застосовує від root. Веб-сервіс сам прав на nmcli con modify не має.
+cat >"/etc/systemd/system/${APPLY_SERVICE}" <<UNIT
+[Unit]
+Description=Apply RPi5 AP SSID/password change from web spool
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+Environment=AP_CON_NAME=${AP_CON_NAME}
+Environment=AP_SPOOL_FILE=${SPOOL_DIR}/ap-config.json
+Environment=AP_CURRENT_FILE=${APP_DIR}/ap-current.json
+Environment=CURRENT_OWNER=${REC_USER}
+ExecStart=${APP_DIR}/ap_apply.sh
+UNIT
+
+cat >"/etc/systemd/system/${APPLY_PATH}" <<UNIT
+[Unit]
+Description=Watch for RPi5 AP config change from web
+
+[Path]
+PathExists=${SPOOL_DIR}/ap-config.json
+Unit=${APPLY_SERVICE}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 systemctl daemon-reload
+systemctl enable --now "${APPLY_PATH}"
 systemctl enable --now "${SERVICE_NAME}"
 
 systemctl --no-pager status "${SERVICE_NAME}" || true
