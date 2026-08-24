@@ -138,3 +138,50 @@ def test_stop_calls_engine_and_returns_ok(client):
 def test_get_on_start_route_not_allowed(client):
     resp = client.get("/api/start")
     assert resp.status_code == 405
+
+
+# --- Camera modes / settings API ---------------------------------------------
+
+
+def test_camera_endpoint_returns_engine_info(client):
+    info = {
+        "src": "csi", "sensor": "imx708",
+        "modes": [{"key": "auto", "label": "автовибір"}],
+        "resolutions": [], "settings": {"width": 1920, "height": 1080, "fps": 30},
+    }
+    with patch.object(web_recorder.engine, "camera_info", return_value=info):
+        resp = client.get("/api/camera")
+    assert resp.status_code == 200
+    assert resp.get_json()["sensor"] == "imx708"
+
+
+def test_settings_post_applies_and_returns_ok(client):
+    with patch.object(
+        web_recorder.engine, "apply_settings", return_value=(True, None),
+    ) as mock_apply:
+        resp = client.post(
+            "/api/settings",
+            json={"mode": "2304:1296", "width": 1920, "height": 1080, "fps": 30},
+        )
+    mock_apply.assert_called_once_with(
+        {"mode": "2304:1296", "width": 1920, "height": 1080, "fps": 30})
+    assert resp.status_code == 200
+    assert resp.get_json()["ok"] is True
+
+
+def test_settings_post_rejected_returns_409(client):
+    with patch.object(
+        web_recorder.engine, "apply_settings",
+        return_value=(False, "не можна міняти під час запису"),
+    ):
+        resp = client.post("/api/settings", json={"mode": "auto"})
+    assert resp.status_code == 409
+    assert resp.get_json()["ok"] is False
+    assert "запис" in resp.get_json()["error"]
+
+
+def test_index_has_capture_mode_controls(client):
+    body = client.get("/").data.decode()
+    assert 'id="mode"' in body
+    assert 'id="res"' in body
+    assert 'id="fps"' in body

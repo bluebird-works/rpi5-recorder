@@ -141,6 +141,28 @@ INDEX_HTML = """<!doctype html>
   .act button.del { background: var(--danger); color: var(--danger-ink); }
   .empty { color: var(--muted); padding: 0.8rem 0; }
 
+  details.set { margin-top: 0.7rem; border: 1px solid var(--edge);
+                border-radius: 12px; background: var(--panel2); }
+  details.set > summary { cursor: pointer; padding: 0.8rem 0.9rem;
+                          font-weight: 700; font-size: 0.95rem;
+                          letter-spacing: 0.02em; list-style: none; }
+  details.set > summary::-webkit-details-marker { display: none; }
+  details.set > summary::after { content: "▾"; float: right; color: var(--muted); }
+  details.set[open] > summary::after { content: "▴"; }
+  details.set .body { padding: 0 0.9rem 0.9rem; }
+  details.set label { display: block; font-size: 0.78rem; color: var(--muted);
+                      text-transform: uppercase; letter-spacing: 0.06em;
+                      margin: 0.6rem 0 0.25rem; }
+  details.set select, details.set input { width: 100%; font-size: 1rem;
+                      padding: 0.65rem; background: var(--panel);
+                      color: var(--text); border: 1px solid var(--edge);
+                      border-radius: 10px; }
+  details.set .btn { margin-top: 0.8rem; background: var(--info);
+                     color: var(--accent-ink); min-height: 52px; width: 100%; }
+  #setmsg { font-size: 0.85rem; color: var(--muted); margin-top: 0.5rem;
+            line-height: 1.5; }
+  #setmsg.err { color: var(--danger); }
+
   form.ap input { font-size: 1rem; padding: 0.7rem; margin: 0.25rem 0;
                   width: 100%; background: var(--panel2); color: var(--text);
                   border: 1px solid var(--edge); border-radius: 10px; }
@@ -190,6 +212,24 @@ INDEX_HTML = """<!doctype html>
 <label class="raw" id="rawWrap">
   <input type="checkbox" id="raw"> raw (сира зйомка — їсть багато місця, хвилини на карту)
 </label>
+<details class="set" id="capset">
+  <summary>Режим зйомки</summary>
+  <div class="body">
+    <p class="hint">Режим сенсора вирішує, скільки кадру видно (FoV) і яка
+      стеля fps. Роздільність запису — окремо: можна знімати повний кадр,
+      а писати легший 1080p.</p>
+    <div id="modeWrap">
+      <label for="mode">Режим сенсора (FoV)</label>
+      <select id="mode"></select>
+    </div>
+    <label for="res">Роздільність запису</label>
+    <select id="res"></select>
+    <label for="fps">FPS</label>
+    <input id="fps" type="number" min="1" max="120" step="1">
+    <button class="btn" id="setapply">Застосувати</button>
+    <div id="setmsg"></div>
+  </div>
+</details>
 <div id="snapWrap"><img id="snapImg" alt="Кадр з камери для перевірки наведення"></div>
 
 <h2>Записи</h2>
@@ -274,6 +314,10 @@ async function refresh() {
     document.getElementById('stop').disabled = !s.recording;
     document.getElementById('raw').disabled = s.recording;
     document.getElementById('snap').disabled = s.recording;
+    // Камеру вже відкрито з іншими параметрами — міняти під запис нічого.
+    for (const id of ['mode', 'res', 'fps', 'setapply']) {
+      document.getElementById(id).disabled = s.recording;
+    }
     paintTimer();
   } catch (e) {
     isRecording = false;
@@ -396,6 +440,85 @@ if (qtheme === 'day' || qtheme === 'night') saved = qtheme;
 applyTheme(saved);
 setInterval(paintTimer, 1000);
 
+// --- Режим зйомки: режим сенсора (FoV) + роздільність + fps ---------------
+let CAM = null;
+function currentMode() {
+  if (!CAM || !CAM.modes.length) return null;
+  const key = document.getElementById('mode').value;
+  return CAM.modes.find(m => m.key === key) || CAM.modes[0];
+}
+function fillRes(keepW, keepH) {
+  const m = currentMode();
+  const list = m ? m.resolutions : CAM.resolutions;
+  const sel = document.getElementById('res');
+  sel.innerHTML = '';
+  for (const r of list) {
+    const o = document.createElement('option');
+    o.value = r.width + 'x' + r.height;
+    o.textContent = r.width + '×' + r.height
+      + (r.hw ? '  (HW-енкодер)' : '  (SW, гріється)');
+    sel.appendChild(o);
+  }
+  // Зберігаємо поточний вибір при зміні режиму; якщо він у новому режимі
+  // недоступний — беремо найбільшу з дозволених.
+  const want = keepW + 'x' + keepH;
+  const last = list[list.length - 1];
+  sel.value = list.some(r => r.width + 'x' + r.height === want)
+    ? want : (last ? last.width + 'x' + last.height : '');
+  const fps = document.getElementById('fps');
+  if (m) fps.max = Math.floor(m.max_fps);
+}
+async function loadCamera() {
+  try {
+    const r = await fetch('/api/camera');
+    CAM = await r.json();
+  } catch (e) { return; }
+  const modeSel = document.getElementById('mode');
+  document.getElementById('modeWrap').style.display =
+    CAM.modes.length ? 'block' : 'none';
+  modeSel.innerHTML = '';
+  for (const m of CAM.modes) {
+    const o = document.createElement('option');
+    o.value = m.key; o.textContent = m.label;
+    modeSel.appendChild(o);
+  }
+  if (CAM.modes.length) {
+    modeSel.value = CAM.modes.some(m => m.key === CAM.settings.mode)
+      ? CAM.settings.mode : 'auto';
+  }
+  fillRes(CAM.settings.width, CAM.settings.height);
+  document.getElementById('fps').value = CAM.settings.fps;
+}
+document.getElementById('mode').addEventListener('change', () => {
+  const [w, h] = document.getElementById('res').value.split('x').map(Number);
+  fillRes(w, h);
+});
+document.getElementById('setapply').addEventListener('click', async () => {
+  const msg = document.getElementById('setmsg');
+  const [width, height] = document.getElementById('res').value.split('x').map(Number);
+  const body = {
+    mode: CAM && CAM.modes.length ? document.getElementById('mode').value : 'auto',
+    width, height,
+    fps: parseInt(document.getElementById('fps').value, 10),
+  };
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const b = await r.json();
+    msg.className = b.ok ? '' : 'err';
+    msg.textContent = b.ok
+      ? 'Збережено. Діє з наступного запису.'
+      : ('Не застосовано: ' + (b.error || 'помилка'));
+    if (b.ok) loadCamera();
+  } catch (e) {
+    msg.className = 'err';
+    msg.textContent = 'нема звʼязку з рекордером';
+  }
+});
+
 async function loadAp() {
   try {
     const r = await fetch('/api/ap');
@@ -428,6 +551,7 @@ document.getElementById('apform').addEventListener('submit', async (e) => {
 
 refresh();
 refreshFiles();
+loadCamera();
 loadAp();
 setInterval(refresh, 2000);
 setInterval(refreshFiles, 5000);
@@ -466,6 +590,19 @@ def create_app():
     @app.route("/api/stop", methods=["POST"])
     def stop():
         return jsonify({"ok": engine.stop_recording()})
+
+    @app.route("/api/camera")
+    def camera():
+        return jsonify(engine.camera_info())
+
+    @app.route("/api/settings", methods=["POST"])
+    def settings():
+        body = request.get_json(silent=True) or {}
+        ok, error = engine.apply_settings(body)
+        if not ok:
+            # 409, не 400: найчастіша причина — «йде запис», це конфлікт стану.
+            return jsonify({"ok": False, "error": error}), 409
+        return jsonify({"ok": True, "settings": engine.get_settings()})
 
     @app.route("/api/snapshot", methods=["POST"])
     def snapshot():

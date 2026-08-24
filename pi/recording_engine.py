@@ -27,6 +27,10 @@ BITRATE = int(os.environ.get("BITRATE", 10_000_000))
 ENCODER = os.environ.get("ENCODER", "auto")
 AUTOFOCUS_MODE = os.environ.get("AUTOFOCUS_MODE", "manual")
 LENS_POSITION = os.environ.get("LENS_POSITION", "0")
+# Режим сенсора у форматі "W:H" для rpicam --mode. Він задає FoV і стелю
+# fps, і не зобов'язаний збігатися з роздільністю запису: режим 2304:1296
+# з виводом 1920x1080 дає повний кадр у 1080p. "" = хай libcamera обирає.
+SENSOR_MODE = os.environ.get("SENSOR_MODE", "")
 SEGMENT_SEC = int(os.environ.get("SEGMENT_SEC", 0))
 MAX_FILES = int(os.environ.get("MAX_FILES", 50))
 SYNC_INTERVAL_SEC = int(os.environ.get("SYNC_INTERVAL_SEC", 3))
@@ -55,6 +59,19 @@ FREE_MB_MIN = int(os.environ.get("FREE_MB_MIN", 500))
 # Обидва розширення, які ми вважаємо записами. Ротація/список/видалення
 # працюють по цьому набору.
 REC_EXTS = (".mp4", ".raw")
+
+# Стеля HW-енкодера по ширині (перевірено: "asked for 2304x1296, got 1920x1296").
+# Вище неї апаратний шлях мовчки ріже кадр, тому кодуємо софтом.
+HW_MAX_WIDTH = 1920
+
+# Кандидати роздільності запису для UI. Фільтруються під обраний режим
+# (не більші за нього і того ж співвідношення сторін), плюс завжди додається
+# рідна роздільність самого режиму.
+COMMON_RESOLUTIONS = [
+    (640, 480), (800, 600), (1024, 768), (1280, 720), (1280, 960),
+    (1600, 1200), (1920, 1080), (2028, 1520), (2304, 1296), (2560, 1440),
+    (3280, 2464), (3840, 2160), (4608, 2592),
+]
 
 # Сенсори з моторним автофокусом. Для решти --autofocus-mode/--lens-position
 # або впадуть, або тихо не дадуть кадрів (=> 0-байтний mp4).
@@ -87,6 +104,36 @@ SNAPSHOT_PATH = os.path.join(REC_DIR, ".snapshot.jpg")
 # Ім'я запису: rec_YYYYMMDD_HHMMSS.mp4 / .raw. Єдиний легальний шаблон —
 # ним же валідуємо download/delete проти path traversal.
 REC_NAME_RE = re.compile(r"^rec_\d{8}_\d{6}\.(?:mp4|raw)$")
+
+
+def _parse_modes(text, max_width, max_height):
+    """Витягує список сенсорних режимів із виводу `rpicam-vid --list-cameras`.
+
+    Рядок режиму: "1536x864 [120.13 fps - (768, 432)/3072x1728 crop]".
+    Crop-рект у ньому — це і є FoV: якщо він менший за повний сенсор, кадр
+    вужчий. Повертає [] якщо блоку Modes нема (стара rpicam-apps / інший вивід)
+    — тоді UI просто не покаже вибір режиму, запис не ламається.
+    """
+    modes = []
+    for m in re.finditer(
+        r"(\d+)x(\d+)\s*\[\s*([\d.]+)\s*fps\s*-\s*"
+        r"\((\d+),\s*(\d+)\)/(\d+)x(\d+)\s*crop\]",
+        text,
+    ):
+        w, h = int(m.group(1)), int(m.group(2))
+        crop_w, crop_h = int(m.group(6)), int(m.group(7))
+        ratio = round(crop_w / max_width, 4) if max_width else 1.0
+        modes.append({
+            "key": "%d:%d" % (w, h),
+            "width": w,
+            "height": h,
+            "max_fps": float(m.group(3)),
+            "crop": [int(m.group(4)), int(m.group(5)), crop_w, crop_h],
+            # Допуск 1%: деякі сенсори віддають крихту менший рект на повному FoV.
+            "full_fov": ratio >= 0.99,
+            "fov_ratio": ratio,
+        })
+    return modes
 
 
 def _detect_camera():
@@ -124,15 +171,16 @@ def _detect_camera():
         "has_autofocus": sensor in AF_CAPABLE_SENSORS,
         "bit_depth": int(fmt.group(1)) if fmt else None,
         "bayer_order": fmt.group(2) if fmt else None,
+        "modes": _parse_modes(text, int(m.group(3)), int(m.group(4))),
     }
 
 
 CAMERA = _detect_camera()
 if CAMERA:
     log.info(
-        "camera: %s max=%dx%d autofocus=%s",
+        "camera: %s max=%dx%d autofocus=%s modes=%d",
         CAMERA["sensor"], CAMERA["max_width"], CAMERA["max_height"],
-        CAMERA["has_autofocus"],
+        CAMERA["has_autofocus"], len(CAMERA["modes"]),
     )
 else:
     log.warning("no CSI camera detected — рекордер стартує, але запис впаде")
@@ -140,12 +188,205 @@ else:
 
 def _use_hw_encoder(encoder_hint, sysfs_root="/sys/class/video4linux"):
     """Pi 4 має апаратний H.264 (bcm2835-codec), Pi 5 — ні, там кодує CPU."""
+    # Вище HW_MAX_WIDTH апаратний енкодер не тягне — навіть якщо його явно
+    # попросили, тихий кроп кадру гірший за софтверний шлях.
+    if WIDTH > HW_MAX_WIDTH:
+        return False
     if encoder_hint != "auto":
         return encoder_hint == "hardware"
     return any(
         p.read_text().strip() == "bcm2835-codec-encode"
         for p in pathlib.Path(sysfs_root).glob("*/name")
     )
+
+
+# --- Налаштування зйомки (режим сенсора / роздільність / fps) -----------------
+# Живуть у module-globals (WIDTH/HEIGHT/FPS/SENSOR_MODE), бо весь модуль так
+# написаний, а на диску дублюються тут — щоб вибір із веб-панелі пережив
+# ребут і power-cut, як і .recording_state.
+SETTINGS_FILE = os.path.join(REC_DIR, ".settings.json")
+
+
+def _save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        log.warning("could not save settings: %s", e)
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("could not load settings: %s", e)
+        return None
+
+
+def get_settings():
+    return {
+        "mode": SENSOR_MODE or "auto",
+        "width": WIDTH,
+        "height": HEIGHT,
+        "fps": FPS,
+    }
+
+
+def _aspect_ok(w, h, mw, mh):
+    """±2% — щоб 1920x1080 пройшло під 2304x1296, а 4:3 під 16:9 не пройшло."""
+    if not (h and mh):
+        return False
+    return abs(w / h - mw / mh) / (mw / mh) <= 0.02
+
+
+def _resolutions_for(mode, strict_aspect=True):
+    """Список роздільностей запису, допустимих для режиму сенсора.
+
+    mode=None — обмежень з боку режиму нема (auto або USB): тоді просто всі
+    кандидати, без фільтра по aspect.
+    """
+    max_w = mode["width"] if mode else (
+        CAMERA["max_width"] if (CAMERA and not USE_USB) else 4096)
+    max_h = mode["height"] if mode else (
+        CAMERA["max_height"] if (CAMERA and not USE_USB) else 4096)
+    pairs = [
+        (w, h) for w, h in COMMON_RESOLUTIONS
+        if w <= max_w and h <= max_h
+        and (not (mode and strict_aspect)
+             or _aspect_ok(w, h, mode["width"], mode["height"]))
+    ]
+    if mode and (mode["width"], mode["height"]) not in pairs:
+        pairs.append((mode["width"], mode["height"]))
+    pairs.sort()
+    return [{"width": w, "height": h, "hw": w <= HW_MAX_WIDTH} for w, h in pairs]
+
+
+def _mode_label(mode):
+    fov = ("повний FoV" if mode["full_fov"]
+           else "кроп FoV %.2f×" % mode["fov_ratio"])
+    return "%d×%d · %s · ≤%d fps" % (
+        mode["width"], mode["height"], fov, int(mode["max_fps"]))
+
+
+def _max_auto_fps():
+    modes = (CAMERA or {}).get("modes") or []
+    return max((m["max_fps"] for m in modes), default=120.0)
+
+
+def camera_info():
+    """Все, що потрібно веб-панелі для селекторів: режими (FoV), допустимі
+    роздільності до кожного з них і поточний вибір."""
+    modes = [] if USE_USB else list((CAMERA or {}).get("modes") or [])
+    out_modes = []
+    if modes:
+        out_modes.append({
+            "key": "auto",
+            "label": "автовибір · ≤%d fps" % int(_max_auto_fps()),
+            "width": CAMERA["max_width"],
+            "height": CAMERA["max_height"],
+            "max_fps": _max_auto_fps(),
+            "full_fov": True,
+            "fov_ratio": 1.0,
+            "resolutions": _resolutions_for(None),
+        })
+        for m in modes:
+            out_modes.append(dict(m, label=_mode_label(m),
+                                  resolutions=_resolutions_for(m)))
+    return {
+        "src": "usb" if USE_USB else "csi",
+        "sensor": None if USE_USB else (CAMERA or {}).get("sensor"),
+        "hw_max_width": HW_MAX_WIDTH,
+        "modes": out_modes,
+        # Для auto/USB — коли режим не обраний або його поняття не існує.
+        "resolutions": _resolutions_for(None),
+        "settings": get_settings(),
+    }
+
+
+def apply_settings(payload):
+    """Змінює режим/роздільність/fps для НАСТУПНОГО запису.
+
+    Повертає (ok, error). Активний запис не чіпаємо — камера вже відкрита з
+    іншими параметрами, перезапуск на льоту рвав би файл.
+    """
+    with lock:
+        if state["recording"]:
+            return False, "не можна міняти під час запису"
+
+    cur = get_settings()
+    try:
+        width = int(payload.get("width", cur["width"]))
+        height = int(payload.get("height", cur["height"]))
+        fps = int(payload.get("fps", cur["fps"]))
+    except (TypeError, ValueError):
+        return False, "роздільність і fps мають бути числами"
+
+    mode_key = str(payload.get("mode") or "auto")
+    mode = None
+    if USE_USB:
+        # У UVC-камери поняття сенсорного режиму (і FoV) немає.
+        mode_key = "auto"
+    elif mode_key != "auto":
+        mode = next(
+            (m for m in ((CAMERA or {}).get("modes") or []) if m["key"] == mode_key),
+            None,
+        )
+        if mode is None:
+            return False, "невідомий режим сенсора %s" % mode_key
+
+    if mode:
+        max_w, max_h, max_fps = mode["width"], mode["height"], mode["max_fps"]
+    elif CAMERA and not USE_USB:
+        max_w, max_h = CAMERA["max_width"], CAMERA["max_height"]
+        max_fps = _max_auto_fps()
+    else:
+        max_w, max_h, max_fps = 4096, 4096, 120.0
+
+    if width % 2 or height % 2:
+        return False, "роздільність має бути парною"
+    if not (128 <= width <= max_w and 96 <= height <= max_h):
+        return False, "роздільність %dx%d не влазить у режим (макс %dx%d)" % (
+            width, height, max_w, max_h)
+    if not (1 <= fps <= int(max_fps)):
+        return False, "fps %d поза межами режиму (1–%d)" % (fps, int(max_fps))
+    if mode and not _aspect_ok(width, height, mode["width"], mode["height"]):
+        return False, "співвідношення сторін не збігається з режимом %s" % mode_key
+
+    globals().update(
+        SENSOR_MODE="" if mode_key == "auto" else mode_key,
+        WIDTH=width, HEIGHT=height, FPS=fps,
+    )
+    _save_settings({"mode": mode_key, "width": width, "height": height, "fps": fps})
+    log.info("settings: mode=%s %dx%d@%d", mode_key, width, height, fps)
+    return True, None
+
+
+def _restore_saved_settings():
+    """Збережений вибір перекриває env на старті сервісу. Без валідації проти
+    камери: якщо залізо змінили, rpicam впаде помітно, а тихо підмінити вибір
+    користувача гірше."""
+    saved = _load_settings()
+    if not saved:
+        return
+    try:
+        globals().update(
+            SENSOR_MODE="" if saved.get("mode", "auto") == "auto" else str(saved["mode"]),
+            WIDTH=int(saved["width"]), HEIGHT=int(saved["height"]),
+            FPS=int(saved["fps"]),
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        log.warning("ignoring bad saved settings: %s", e)
+        return
+    log.info("restored settings: mode=%s %dx%d@%d",
+             saved.get("mode"), WIDTH, HEIGHT, FPS)
+
+
+_restore_saved_settings()
 
 
 def _persist_state(active, raw=False):
@@ -305,6 +546,9 @@ def _start_pipeline():
         "--width", str(WIDTH), "--height", str(HEIGHT),
         "--framerate", str(FPS),
     ]
+    # Режим сенсора задає FoV незалежно від роздільності виводу.
+    if SENSOR_MODE:
+        cam_cmd += ["--mode", SENSOR_MODE]
     if CAMERA is None or CAMERA["has_autofocus"]:
         cam_cmd += ["--autofocus-mode", AUTOFOCUS_MODE]
         if AUTOFOCUS_MODE == "manual":
@@ -467,6 +711,8 @@ def _start_raw_pipeline():
         "--width", str(WIDTH), "--height", str(HEIGHT),
         "--framerate", str(RAW_FPS),
     ]
+    if SENSOR_MODE:
+        cam_cmd += ["--mode", SENSOR_MODE]
     if CAMERA is None or CAMERA["has_autofocus"]:
         cam_cmd += ["--autofocus-mode", AUTOFOCUS_MODE]
         if AUTOFOCUS_MODE == "manual":
@@ -507,6 +753,7 @@ def _write_raw_sidecar(out_path):
         "height": HEIGHT,
         "fps": RAW_FPS,
         "sensor": CAMERA["sensor"] if CAMERA else None,
+        "sensor_mode": SENSOR_MODE or "auto",
         "bit_depth": CAMERA.get("bit_depth") if CAMERA else None,
         "bayer_order": CAMERA.get("bayer_order") if CAMERA else None,
         "format": "raw Bayer, headerless, one frame after another",
@@ -680,6 +927,9 @@ def capture_snapshot():
             "rpicam-jpeg", "-n", "-t", "500",
             "--width", str(WIDTH), "--height", str(HEIGHT),
         ]
+        # Той самий режим, що піде в запис — інакше знімок показує інший кадр.
+        if SENSOR_MODE:
+            cmd += ["--mode", SENSOR_MODE]
         if CAMERA is None or CAMERA["has_autofocus"]:
             cmd += ["--autofocus-mode", AUTOFOCUS_MODE]
             if AUTOFOCUS_MODE == "manual":

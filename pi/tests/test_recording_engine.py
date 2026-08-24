@@ -448,3 +448,238 @@ def test_space_watchdog_stops_on_low_space(tmp_path, monkeypatch):
     ev = engine.threading.Event()
     engine._space_watchdog_loop(ev)
     assert calls == ["low_space"]
+
+
+# --- Sensor modes / resolution / FoV selection -------------------------------
+
+LIST_CAMERAS_IMX708 = """Available cameras
+-----------------
+0 : imx708 [4608x2592 10-bit RGGB] (/base/soc/i2c0mux/i2c@88000/imx708@1a)
+    Modes: 'SRGGB10_CSI2P' : 1536x864 [120.13 fps - (768, 432)/3072x1728 crop]
+                             2304x1296 [56.03 fps - (0, 0)/4608x2592 crop]
+                             4608x2592 [14.35 fps - (0, 0)/4608x2592 crop]
+"""
+
+LIST_CAMERAS_IMX219 = """Available cameras
+-----------------
+0 : imx219 [3280x2464 10-bit RGGB] (/base/soc/i2c0mux/i2c@7e004000/imx219@10)
+    Modes: 'SRGGB10_CSI2P' : 640x480 [206.65 fps - (1000, 752)/1280x960 crop]
+                             1640x1232 [41.85 fps - (0, 0)/3280x2464 crop]
+                             3280x2464 [21.19 fps - (0, 0)/3280x2464 crop]
+"""
+
+
+def test_parse_modes_imx708_reads_all_three():
+    modes = engine._parse_modes(LIST_CAMERAS_IMX708, 4608, 2592)
+    assert [(m["width"], m["height"]) for m in modes] == [
+        (1536, 864), (2304, 1296), (4608, 2592)
+    ]
+    assert modes[0]["max_fps"] == 120.13
+    assert modes[1]["max_fps"] == 56.03
+
+
+def test_parse_modes_marks_crop_vs_full_fov():
+    modes = engine._parse_modes(LIST_CAMERAS_IMX708, 4608, 2592)
+    crop, full, native = modes
+    # 3072x1728 з 4608x2592 — вужчий кадр, це і є «кроп FoV».
+    assert crop["full_fov"] is False
+    assert round(crop["fov_ratio"], 3) == 0.667
+    assert full["full_fov"] is True
+    assert full["fov_ratio"] == 1.0
+    assert native["full_fov"] is True
+
+
+def test_parse_modes_works_for_non_imx708_sensor():
+    modes = engine._parse_modes(LIST_CAMERAS_IMX219, 3280, 2464)
+    assert [(m["width"], m["height"]) for m in modes] == [
+        (640, 480), (1640, 1232), (3280, 2464)
+    ]
+    assert modes[0]["full_fov"] is False
+    assert modes[1]["full_fov"] is True
+
+
+def test_parse_modes_empty_when_no_modes_block():
+    assert engine._parse_modes("0 : imx708 [4608x2592 10-bit RGGB]", 4608, 2592) == []
+
+
+def test_detect_camera_includes_modes(monkeypatch):
+    monkeypatch.setattr(
+        engine.subprocess, "run",
+        lambda *a, **kw: MagicMock(stdout=LIST_CAMERAS_IMX708, stderr=""),
+    )
+    cam = engine._detect_camera()
+    assert cam["sensor"] == "imx708"
+    assert len(cam["modes"]) == 3
+    assert cam["modes"][1]["key"] == "2304:1296"
+
+
+def test_use_hw_encoder_forced_software_above_1920(monkeypatch):
+    # HW-енкодер упирається в 1920 по ширині — вище мусить бути software,
+    # інакше rpicam тихо ріже кадр до 1920.
+    monkeypatch.setattr(engine, "WIDTH", 2304)
+    assert engine._use_hw_encoder("hardware") is False
+    monkeypatch.setattr(engine, "WIDTH", 1920)
+    assert engine._use_hw_encoder("hardware") is True
+
+
+def _fake_camera():
+    return {
+        "index": 0, "sensor": "imx708", "max_width": 4608, "max_height": 2592,
+        "has_autofocus": True, "bit_depth": 10, "bayer_order": "RGGB",
+        "modes": engine._parse_modes(LIST_CAMERAS_IMX708, 4608, 2592),
+    }
+
+
+def test_resolutions_for_mode_filters_by_size_and_aspect(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    res = engine._resolutions_for(engine.CAMERA["modes"][1])  # 2304x1296, 16:9
+    pairs = [(r["width"], r["height"]) for r in res]
+    assert (1280, 720) in pairs
+    assert (1920, 1080) in pairs
+    assert (2304, 1296) in pairs           # native режиму завжди в списку
+    assert all(w <= 2304 and h <= 1296 for w, h in pairs)
+    assert (640, 480) not in pairs         # 4:3 не той aspect
+    hw = {(r["width"], r["height"]): r["hw"] for r in res}
+    assert hw[(1920, 1080)] is True
+    assert hw[(2304, 1296)] is False       # вище стелі HW-енкодера
+
+
+def test_camera_info_lists_modes_and_current_settings(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    monkeypatch.setattr(engine, "USE_USB", False)
+    info = engine.camera_info()
+    assert info["src"] == "csi"
+    assert info["sensor"] == "imx708"
+    assert info["modes"][0]["key"] == "auto"     # автовибір першим
+    assert [m["key"] for m in info["modes"][1:]] == [
+        "1536:864", "2304:1296", "4608:2592"
+    ]
+    assert info["settings"]["width"] == engine.WIDTH
+
+
+def test_camera_info_usb_has_no_modes(monkeypatch):
+    monkeypatch.setattr(engine, "USE_USB", True)
+    info = engine.camera_info()
+    assert info["src"] == "usb"
+    assert info["modes"] == []
+    assert len(info["resolutions"]) > 0
+
+
+def test_apply_settings_updates_globals(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    monkeypatch.setattr(engine, "SETTINGS_FILE", "/dev/null")
+    engine.state.update(recording=False)
+    ok, err = engine.apply_settings(
+        {"mode": "2304:1296", "width": 1920, "height": 1080, "fps": 30})
+    assert (ok, err) == (True, None)
+    assert engine.SENSOR_MODE == "2304:1296"
+    assert (engine.WIDTH, engine.HEIGHT, engine.FPS) == (1920, 1080, 30)
+
+
+def test_apply_settings_rejected_while_recording(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    engine.state.update(recording=True)
+    ok, err = engine.apply_settings({"mode": "auto", "width": 1280, "height": 720})
+    engine.state.update(recording=False)
+    assert ok is False
+    assert "запис" in err
+
+
+def test_apply_settings_rejects_unknown_mode(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    engine.state.update(recording=False)
+    ok, err = engine.apply_settings({"mode": "9999:9999", "width": 1280, "height": 720})
+    assert ok is False
+
+
+def test_apply_settings_rejects_resolution_above_mode(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    engine.state.update(recording=False)
+    ok, err = engine.apply_settings(
+        {"mode": "1536:864", "width": 1920, "height": 1080, "fps": 30})
+    assert ok is False
+
+
+def test_apply_settings_rejects_fps_above_mode_ceiling(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    engine.state.update(recording=False)
+    ok, err = engine.apply_settings(
+        {"mode": "2304:1296", "width": 1920, "height": 1080, "fps": 90})
+    assert ok is False
+    assert "fps" in err.lower()
+
+
+def test_apply_settings_rejects_mismatched_aspect(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    engine.state.update(recording=False)
+    ok, err = engine.apply_settings(
+        {"mode": "2304:1296", "width": 640, "height": 480, "fps": 30})
+    assert ok is False
+
+
+def test_settings_round_trip_through_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    monkeypatch.setattr(engine, "SETTINGS_FILE", str(tmp_path / ".settings.json"))
+    engine.state.update(recording=False)
+    assert engine.apply_settings(
+        {"mode": "1536:864", "width": 1536, "height": 864, "fps": 120})[0] is True
+    assert engine._load_settings() == {
+        "mode": "1536:864", "width": 1536, "height": 864, "fps": 120}
+
+
+def test_start_pipeline_passes_sensor_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "SENSOR_MODE", "2304:1296")
+    monkeypatch.setattr(engine, "_use_hw_encoder", lambda hint: False)
+    cam, ff = _mock_popen_alive()
+    with patch.object(engine.subprocess, "Popen", side_effect=[cam, ff]) as mock_popen:
+        engine._start_pipeline()
+    cam_argv = mock_popen.call_args_list[0].args[0]
+    assert "--mode" in cam_argv
+    assert cam_argv[cam_argv.index("--mode") + 1] == "2304:1296"
+
+
+def test_start_pipeline_omits_mode_when_auto(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "SENSOR_MODE", "")
+    monkeypatch.setattr(engine, "_use_hw_encoder", lambda hint: False)
+    cam, ff = _mock_popen_alive()
+    with patch.object(engine.subprocess, "Popen", side_effect=[cam, ff]) as mock_popen:
+        engine._start_pipeline()
+    assert "--mode" not in mock_popen.call_args_list[0].args[0]
+
+
+def test_snapshot_uses_same_sensor_mode(tmp_path, monkeypatch):
+    # Інакше «перевірити кадр» показував би не той FoV, що піде в запис.
+    monkeypatch.setattr(engine, "USE_USB", False)
+    monkeypatch.setattr(engine, "SENSOR_MODE", "1536:864")
+    monkeypatch.setattr(engine, "SNAPSHOT_PATH", str(tmp_path / ".snapshot.jpg"))
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    engine.state.update(recording=False)
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        with open(engine.SNAPSHOT_PATH, "wb") as f:
+            f.write(b"\xff\xd8jpeg")
+        return MagicMock()
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+    engine.capture_snapshot()
+    assert "--mode" in seen["cmd"]
+    assert seen["cmd"][seen["cmd"].index("--mode") + 1] == "1536:864"
+
+
+def test_start_raw_pipeline_passes_sensor_mode(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    monkeypatch.setattr(engine, "PIPELINE_START_TIMEOUT", 0.05)
+    monkeypatch.setattr(engine, "SENSOR_MODE", "4608:2592")
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    cam = MagicMock()
+    cam.poll.return_value = None
+    with patch.object(engine.subprocess, "Popen", return_value=cam) as mock_popen:
+        engine._start_raw_pipeline()
+    argv = mock_popen.call_args_list[0].args[0]
+    assert "--mode" in argv and "4608:2592" in argv
