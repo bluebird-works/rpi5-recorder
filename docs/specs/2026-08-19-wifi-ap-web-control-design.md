@@ -1,11 +1,11 @@
 # WiFi AP + Web Control — Mode C
 
 Дата: 2026-08-19
-Статус: погоджено з Дашею, готово до writing-plans
+Статус: погоджено з Дашею, готово до плану реалізації
 
 ## Контекст і мета
 
-Проєкт має два незалежні режими запису: **A. BLE web control** (`pi/ble_recorder.py` + `index.html` на GitHub Pages) і **B. Auto-record** (`pi/autostart.sh`). Обидва задокументовані в `CLAUDE.md` як свідомо ізольовані — BLE обрано саме тому, що телефон не мусить бути в мережі Pi (`feedback_ble_scope.md`, узгоджено з Дмитром 2026-07-30).
+Проєкт має два незалежні режими запису: **A. BLE web control** (`pi/ble_recorder.py` + `index.html` на GitHub Pages) і **B. Auto-record** (`pi/autostart.sh`). Обидва свідомо ізольовані — BLE обрано саме тому, що телефон не мусить бути в мережі Pi (узгоджено з Дмитром 2026-07-30).
 
 Новий таск від R&D просить третій, окремий канал керування: Pi піднімає власну WiFi AP на старті, у браузері з локального IP відкривається веб-інтерфейс зі статусом рекордера, таблицею записів (download/delete), можливістю перейменувати SSID/пароль AP (кілька рекордерів на одній локації), і апгрейд рекордера на raw-data режим.
 
@@ -16,7 +16,7 @@
 ## Дослідження (WebSearch — Firecrawl MCP не підключено в цій сесії, використано WebSearch)
 
 - nmcli-based AP — рекомендований шлях для Debian 13 (trixie) з NetworkManager, hostapd+dnsmasq — legacy, вимагає вимкнення NM: [raspiCamSrv Trixie hotspot guide](https://signag.github.io/raspi-cam-srv/latest/bp_Hotspot_Trixie/), [RaspberryTips access-point guide](https://raspberrytips.com/access-point-setup-raspberry-pi/), [Raspberry Pi Forums Trixie AP thread](https://forums.raspberrypi.com/viewtopic.php?t=395800).
-- Це узгоджується з існуючою забороною в `CLAUDE.md` на raspap/hostapd — той запис писався для BLE-контексту ("не hotspot"), а нативний AP-шлях на Trixie і так не використовує hostapd.
+- Це узгоджується з існуючою забороною на raspap/hostapd — той запис писався для BLE-контексту ("не hotspot"), а нативний AP-шлях на Trixie і так не використовує hostapd.
 - **Не перевірено наживо**: обидва тестові Pi (`recorder` 100.85.195.10, `recorder2` 100.109.56.87) на момент написання offline в тайлнеті Дмитра (`tailscale status` — recorder 4d ago, recorder2 4h ago). NetworkManager на реальному залізі не підтверджено — install-скрипт мусить це перевіряти явно, не припускати.
 - Flask (`Context7 /pallets/flask`): `send_file()` підтримує range-requests і `conditional=True`/`etag=True` за замовчуванням незалежно від типу аргументу (шлях чи `BytesIO`, range для `BytesIO` — з Flask 1.1). Шлях просто зручніший — Werkzeug сам бере mtime/mimetype, з `BytesIO` це довелось би виставляти вручну. Актуально для майбутнього download відео (поза цим спеком, але вплинуло на вибір фреймворку зараз).
 - **`ipv4.method shared` (nmcli AP) технічно потребує `dnsmasq`** — NetworkManager викликає його як зовнішній процес для DHCP/DNS клієнтам AP. У Debian trixie це `Recommends` пакета `network-manager` (не `Depends`), офіційний опис пакета: *"dnsmasq-base/iptables: Required for creating Ad-hoc connections and connection sharing."* Голий `apt-get install network-manager` підтягує його лише тому, що Recommends увімкнені за замовчуванням — на мінімальному/headless-образі з `Install-Recommends "false"` AP підніметься (SSID видно, WPA проходить), але DHCP-лізи ніхто не видасть і телефон не отримає IP, без жодної явної помилки. Тому `install_web.sh` ставить `dnsmasq-base` явно, а не покладається на Recommends.

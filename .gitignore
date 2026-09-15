@@ -3,5 +3,3 @@ __pycache__/
 *.mp4
 .DS_Store
 .env
-.playwright-mcp/
-CLAUDE.md
