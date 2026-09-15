@@ -128,6 +128,7 @@ INDEX_HTML = """<!doctype html>
              display: none; }
 
   table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  td.bad { color: var(--danger); font-weight: 700; }
   th, td { border-bottom: 1px solid var(--edge); padding: 0.6rem 0.5rem;
            text-align: left; }
   th { color: var(--muted); font-size: 0.72rem; text-transform: uppercase;
@@ -329,6 +330,16 @@ async function refresh() {
     document.getElementById('snap').disabled = true;
   }
 }
+function statusCell(f, isRec) {
+  if (isRec) return '<td class="rec">● пишеться</td>';
+  const c = f.fps_check;
+  // Недобір кадрів: файл маркований заявленим fps, тож відео йде прискорено.
+  if (c && !c.ok) {
+    return '<td class="bad" title="Камера не встигала — відео програється прискорено">⚠ '
+      + c.real_fps + ' з ' + c.requested_fps + ' fps</td>';
+  }
+  return '<td>готово</td>';
+}
 async function refreshFiles() {
   const tb = document.querySelector('#files tbody');
   try {
@@ -351,7 +362,7 @@ async function refreshFiles() {
         '<td>' + f.name + '</td>' +
         '<td>' + fmtSize(f.size) + '</td>' +
         '<td>' + fmtDate(f.created) + '</td>' +
-        '<td class="' + (isRec ? 'rec' : '') + '">' + (isRec ? '● пишеться' : 'готово') + '</td>' +
+        statusCell(f, isRec) +
         '<td class="act">' + actions + '</td>';
       tb.appendChild(tr);
     }
@@ -396,6 +407,8 @@ async function stopRec() {
   try {
     await fetch('/api/stop', {method: 'POST'});
     refresh(); refreshFiles();
+    // Перевірка fps рахується у фоні після стопу — підтягнути її результат.
+    setTimeout(refreshFiles, 4000);
   } catch (e) {
     document.getElementById('statusWord').textContent = 'НЕМА ЗВʼЯЗКУ';
   }
@@ -455,7 +468,7 @@ function fillRes(keepW, keepH) {
   for (const r of list) {
     const o = document.createElement('option');
     o.value = r.width + 'x' + r.height;
-    o.textContent = r.width + '×' + r.height
+    o.textContent = r.width + '×' + r.height + ' · ≤' + r.max_fps + ' fps'
       + (r.hw ? '  (HW-енкодер)' : '  (SW, гріється)');
     sel.appendChild(o);
   }
@@ -465,9 +478,18 @@ function fillRes(keepW, keepH) {
   const last = list[list.length - 1];
   sel.value = list.some(r => r.width + 'x' + r.height === want)
     ? want : (last ? last.width + 'x' + last.height : '');
-  const fps = document.getElementById('fps');
-  if (m) fps.max = Math.floor(m.max_fps);
+  syncFps();
 }
+function syncFps() {
+  // Стеля fps залежить і від режиму, і від роздільності (на Pi 4 — заміряна).
+  const m = currentMode();
+  const list = m ? m.resolutions : CAM.resolutions;
+  const r = list.find(x => x.width + 'x' + x.height === document.getElementById('res').value);
+  const fps = document.getElementById('fps');
+  fps.max = r ? r.max_fps : (m ? Math.floor(m.max_fps) : 120);
+  if (parseInt(fps.value, 10) > fps.max) fps.value = fps.max;
+}
+document.getElementById('res').addEventListener('change', syncFps);
 async function loadCamera() {
   try {
     const r = await fetch('/api/camera');

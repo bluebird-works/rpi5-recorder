@@ -683,3 +683,127 @@ def test_start_raw_pipeline_passes_sensor_mode(tmp_path, monkeypatch):
         engine._start_raw_pipeline()
     argv = mock_popen.call_args_list[0].args[0]
     assert "--mode" in argv and "4608:2592" in argv
+
+
+# --- Стеля fps на Pi 4 і перевірка реального fps після запису -----------------
+
+
+def test_fps_cap_pi4_by_resolution(monkeypatch):
+    monkeypatch.setattr(engine, "FPS_CAPPED", True)
+    monkeypatch.setattr(engine, "USE_USB", False)
+    assert engine._fps_cap(1280, 720, 120.13) == 60
+    assert engine._fps_cap(1536, 864, 120.13) == 30
+    assert engine._fps_cap(1920, 1080, 56.03) == 30
+    assert engine._fps_cap(1280, 720, 14.35) == 14   # режим нижчий за стелю
+
+
+def test_fps_cap_absent_on_pi5_and_usb(monkeypatch):
+    monkeypatch.setattr(engine, "USE_USB", False)
+    monkeypatch.setattr(engine, "FPS_CAPPED", False)
+    assert engine._fps_cap(1536, 864, 120.13) == 120
+    monkeypatch.setattr(engine, "FPS_CAPPED", True)
+    monkeypatch.setattr(engine, "USE_USB", True)
+    assert engine._fps_cap(1536, 864, 120.13) == 120
+
+
+def test_resolutions_for_reports_max_fps(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    monkeypatch.setattr(engine, "USE_USB", False)
+    monkeypatch.setattr(engine, "FPS_CAPPED", True)
+    res = engine._resolutions_for(engine.CAMERA["modes"][0])  # 1536x864 @120
+    fps = {(r["width"], r["height"]): r["max_fps"] for r in res}
+    assert fps[(1280, 720)] == 60
+    assert fps[(1536, 864)] == 30
+
+
+def test_apply_settings_rejects_fps_above_pi4_cap(monkeypatch):
+    monkeypatch.setattr(engine, "CAMERA", _fake_camera())
+    monkeypatch.setattr(engine, "USE_USB", False)
+    monkeypatch.setattr(engine, "FPS_CAPPED", True)
+    monkeypatch.setattr(engine, "SETTINGS_FILE", "/dev/null")
+    engine.state.update(recording=False)
+    ok, err = engine.apply_settings(
+        {"mode": "1536:864", "width": 1280, "height": 720, "fps": 120})
+    assert ok is False
+    assert "fps" in err.lower()
+    ok, err = engine.apply_settings(
+        {"mode": "1536:864", "width": 1280, "height": 720, "fps": 60})
+    assert (ok, err) == (True, None)
+
+
+def test_check_recording_flags_dropped_frames(tmp_path, monkeypatch):
+    rec = tmp_path / "rec_20260915_162047.mp4"
+    _touch(rec)
+    monkeypatch.setattr(engine, "_count_video_frames", lambda p: 1400)
+    engine._check_recording(str(rec), 120, 20.0)
+    assert engine._load_fps_check(str(rec)) == {
+        "requested_fps": 120, "real_fps": 70.0, "ok": False}
+
+
+def test_check_recording_ok_when_fps_held(tmp_path, monkeypatch):
+    rec = tmp_path / "rec_20260915_161825.mp4"
+    _touch(rec)
+    monkeypatch.setattr(engine, "_count_video_frames", lambda p: 600)
+    engine._check_recording(str(rec), 30, 20.0)
+    assert engine._load_fps_check(str(rec))["ok"] is True
+
+
+def test_count_video_frames_parses_ffprobe(monkeypatch):
+    done = MagicMock(stdout="1257\n")
+    with patch.object(engine.subprocess, "run", return_value=done) as run:
+        assert engine._count_video_frames("/x/rec.mp4") == 1257
+    assert run.call_args[0][0][0] == "ffprobe"
+
+
+def test_stop_recording_schedules_fps_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "STATE_FILE", str(tmp_path / ".recording_state"))
+    monkeypatch.setattr(engine, "FPS", 60)
+    out_path = str(tmp_path / "rec_test.mp4")
+    engine.state.update(
+        recording=True, cam=MagicMock(), ff=MagicMock(),
+        stop_event=engine.threading.Event(), out_path=out_path,
+        started_at=engine.time.time() - 20, raw=False,
+    )
+    with patch.object(engine.threading, "Thread") as thread:
+        assert engine.stop_recording() is True
+    thread.assert_called_once()
+    kwargs = thread.call_args.kwargs
+    assert kwargs["target"] is engine._check_recording
+    path, fps, wall = kwargs["args"]
+    assert (path, fps) == (out_path, 60)
+    assert wall >= 20
+
+
+def test_stop_recording_skips_check_for_short_or_segmented(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "STATE_FILE", str(tmp_path / ".recording_state"))
+    for out_path, age in ((str(tmp_path / "rec_a.mp4"), 2), (None, 60)):
+        engine.state.update(
+            recording=True, cam=MagicMock(), ff=MagicMock(),
+            stop_event=engine.threading.Event(), out_path=out_path,
+            started_at=engine.time.time() - age, raw=False,
+        )
+        with patch.object(engine.threading, "Thread") as thread:
+            assert engine.stop_recording() is True
+        thread.assert_not_called()
+
+
+def test_list_recordings_includes_fps_check(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    _touch(tmp_path / "rec_20260915_162047.mp4")
+    (tmp_path / "rec_20260915_162047.json").write_text(
+        '{"requested_fps": 120, "frames": 1400, "wall_sec": 20.0,'
+        ' "real_fps": 70.0, "ok": false}')
+    _touch(tmp_path / "rec_20260915_161825.mp4")
+    rows = {r["name"]: r for r in engine.list_recordings()}
+    assert rows["rec_20260915_162047.mp4"]["fps_check"] == {
+        "requested_fps": 120, "real_fps": 70.0, "ok": False}
+    assert rows["rec_20260915_161825.mp4"]["fps_check"] is None
+
+
+def test_delete_mp4_removes_fps_check_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "REC_DIR", str(tmp_path))
+    _touch(tmp_path / "rec_20260915_162047.mp4")
+    (tmp_path / "rec_20260915_162047.json").write_text("{}")
+    engine.state.update(out_path=None)
+    assert engine.delete_recording("rec_20260915_162047.mp4") is True
+    assert not (tmp_path / "rec_20260915_162047.json").exists()

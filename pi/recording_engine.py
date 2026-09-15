@@ -64,6 +64,21 @@ REC_EXTS = (".mp4", ".raw")
 # Вище неї апаратний шлях мовчки ріже кадр, тому кодуємо софтом.
 HW_MAX_WIDTH = 1920
 
+# Стеля fps на Pi 4 (bcm2835 ISP + HW H.264), заміряно на IMX708 2026-09-15:
+# до 1280×720 чисто тримає 60, більший кадр — 30. Вище не встигає вже ISP, а не
+# енкодер (сирий YUV 1280×720@120 без кодування — ~92 fps), і mp4 все одно
+# маркується заявленим fps: 720p@120 давав ~67 реальних кадрів/с і прискорене
+# відео. На Pi 5 такої стелі нема (1536×864@120 там чистий).
+PI4_FPS_MAX = int(os.environ.get("PI4_FPS_MAX", 30))
+PI4_FPS_MAX_SMALL = int(os.environ.get("PI4_FPS_MAX_SMALL", 60))
+PI4_SMALL_PIXELS = 1280 * 720
+
+# Перевірка після стопу: реальних кадрів/с менше цієї частки від заявленого fps —
+# запис позначається попередженням. Коротші записи не міряємо: старт і дренаж
+# пайплайна там з'їдають помітну частку часу й дають хибні тривоги.
+FPS_CHECK_RATIO = float(os.environ.get("FPS_CHECK_RATIO", 0.95))
+FPS_CHECK_MIN_SEC = 5
+
 # Кандидати роздільності запису для UI. Фільтруються під обраний режим
 # (не більші за нього і того ж співвідношення сторін), плюс завжди додається
 # рідна роздільність самого режиму.
@@ -186,18 +201,36 @@ else:
     log.warning("no CSI camera detected — рекордер стартує, але запис впаде")
 
 
-def _use_hw_encoder(encoder_hint, sysfs_root="/sys/class/video4linux"):
+def _has_hw_encoder_node(sysfs_root="/sys/class/video4linux"):
     """Pi 4 має апаратний H.264 (bcm2835-codec), Pi 5 — ні, там кодує CPU."""
+    return any(
+        p.read_text().strip() == "bcm2835-codec-encode"
+        for p in pathlib.Path(sysfs_root).glob("*/name")
+    )
+
+
+def _use_hw_encoder(encoder_hint, sysfs_root="/sys/class/video4linux"):
     # Вище HW_MAX_WIDTH апаратний енкодер не тягне — навіть якщо його явно
     # попросили, тихий кроп кадру гірший за софтверний шлях.
     if WIDTH > HW_MAX_WIDTH:
         return False
     if encoder_hint != "auto":
         return encoder_hint == "hardware"
-    return any(
-        p.read_text().strip() == "bcm2835-codec-encode"
-        for p in pathlib.Path(sysfs_root).glob("*/name")
-    )
+    return _has_hw_encoder_node(sysfs_root)
+
+
+# bcm2835-codec є тільки на Pi 4 — ним і розпізнаємо платформу зі стелею fps.
+FPS_CAPPED = _has_hw_encoder_node()
+
+
+def _fps_cap(width, height, mode_max_fps):
+    """Найбільший fps, який залізо реально тримає для цієї роздільності."""
+    cap = int(mode_max_fps)
+    # USB-камера йде повз ISP — заміри Pi 4 до неї не застосовні.
+    if FPS_CAPPED and not USE_USB:
+        limit = PI4_FPS_MAX_SMALL if width * height <= PI4_SMALL_PIXELS else PI4_FPS_MAX
+        cap = min(cap, limit)
+    return cap
 
 
 # --- Налаштування зйомки (режим сенсора / роздільність / fps) -----------------
@@ -263,7 +296,9 @@ def _resolutions_for(mode, strict_aspect=True):
     if mode and (mode["width"], mode["height"]) not in pairs:
         pairs.append((mode["width"], mode["height"]))
     pairs.sort()
-    return [{"width": w, "height": h, "hw": w <= HW_MAX_WIDTH} for w, h in pairs]
+    mode_max_fps = mode["max_fps"] if mode else _max_auto_fps()
+    return [{"width": w, "height": h, "hw": w <= HW_MAX_WIDTH,
+             "max_fps": _fps_cap(w, h, mode_max_fps)} for w, h in pairs]
 
 
 def _mode_label(mode):
@@ -352,8 +387,10 @@ def apply_settings(payload):
     if not (128 <= width <= max_w and 96 <= height <= max_h):
         return False, "роздільність %dx%d не влазить у режим (макс %dx%d)" % (
             width, height, max_w, max_h)
-    if not (1 <= fps <= int(max_fps)):
-        return False, "fps %d поза межами режиму (1–%d)" % (fps, int(max_fps))
+    ceiling = _fps_cap(width, height, max_fps)
+    if not (1 <= fps <= ceiling):
+        return False, "fps %d поза межами для %dx%d (1–%d)" % (
+            fps, width, height, ceiling)
     if mode and not _aspect_ok(width, height, mode["width"], mode["height"]):
         return False, "співвідношення сторін не збігається з режимом %s" % mode_key
 
@@ -460,14 +497,12 @@ def rotate_old_files():
 
 
 def _sidecar_path(rec_path):
-    """Raw-запис rec_….raw має сусідній rec_….json з метаданими сенсора —
-    без нього headerless Bayer-потік нечитабельний."""
+    """Сусідній rec_….json. У raw — метадані сенсора (без них headerless
+    Bayer-потік нечитабельний), у mp4 — результат перевірки реального fps."""
     return os.path.splitext(rec_path)[0] + ".json"
 
 
 def _remove_sidecar(rec_path):
-    if not rec_path.endswith(".raw"):
-        return
     try:
         os.remove(_sidecar_path(rec_path))
     except OSError:
@@ -511,9 +546,59 @@ def list_recordings():
             "size": st.st_size,
             "created": int(st.st_mtime),
             "status": "recording" if name == active else "saved",
+            "fps_check": _load_fps_check(p) if name.endswith(".mp4") else None,
         })
     out.sort(key=lambda r: r["name"], reverse=True)
     return out
+
+
+def _load_fps_check(rec_path):
+    try:
+        with open(_sidecar_path(rec_path)) as f:
+            data = json.load(f)
+        return {k: data[k] for k in ("requested_fps", "real_fps", "ok")}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _count_video_frames(path):
+    """Кількість відеопакетів у файлі (для H.264 у mp4 = кадрів) або None."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=120,
+        )
+        return int(r.stdout.strip().splitlines()[0].strip(","))
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError,
+            ValueError, IndexError) as e:
+        log.warning("frame count failed for %s: %s", os.path.basename(path), e)
+        return None
+
+
+def _check_recording(out_path, fps, wall_sec):
+    """Реальний fps запису проти заявленого. Файл маркується заявленим fps
+    незалежно від того, скільки кадрів камера встигла віддати, тож недобір
+    видно тільки так: кадри / реальний час запису."""
+    frames = _count_video_frames(out_path)
+    if frames is None or wall_sec <= 0:
+        return
+    real = frames / wall_sec
+    result = {
+        "requested_fps": fps,
+        "frames": frames,
+        "wall_sec": round(wall_sec, 1),
+        "real_fps": round(real, 1),
+        "ok": real >= fps * FPS_CHECK_RATIO,
+    }
+    try:
+        with open(_sidecar_path(out_path), "w") as f:
+            json.dump(result, f)
+    except OSError as e:
+        log.warning("could not write fps check: %s", e)
+    if not result["ok"]:
+        log.warning("%s: real %.1f fps of requested %d — frames dropped",
+                    os.path.basename(out_path), real, fps)
 
 
 def delete_recording(name):
@@ -852,6 +937,10 @@ def stop_recording(reason="manual"):
         cam = state["cam"]
         ff = state["ff"]
         stop_event = state["stop_event"]
+        out_path = state["out_path"]
+        started_at = state["started_at"]
+        raw = state["raw"]
+    stopped_at = time.time()
     stop_event.set()
     # Валимо тільки камеру: ffmpeg бачить EOF, дописує moov і виходить сам.
     if cam:
@@ -881,6 +970,16 @@ def stop_recording(reason="manual"):
         )
     _persist_state(False)
     log.info("REC stop reason=%s", reason)
+    # Сегменти (out_path=None) і raw не перевіряємо: час запису на окремий
+    # сегмент невідомий, а raw пише фіксований RAW_FPS без енкодера.
+    if (out_path and not raw and started_at is not None
+            and stopped_at - started_at >= FPS_CHECK_MIN_SEC):
+        # Окремий тред: ffprobe на великому файлі — секунди, стоп не має чекати.
+        threading.Thread(
+            target=_check_recording,
+            args=(out_path, FPS, stopped_at - started_at),
+            daemon=True,
+        ).start()
     return True
 
 
