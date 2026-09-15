@@ -2,7 +2,7 @@
 
 Copied out of ble_recorder.py's pipeline logic rather than imported from it —
 ble_recorder.py is left untouched by design, see
-docs/superpowers/specs/2026-08-19-wifi-ap-web-control-design.md for why.
+docs/specs/2026-08-19-wifi-ap-web-control-design.md for why.
 No BLE-specific pieces here (manual JSON config, presets, snapshot chunking):
 this engine always runs a single env-configured recording, same convention
 as autostart.sh. Supports two output modes: H.264/mp4 (default) and raw Bayer

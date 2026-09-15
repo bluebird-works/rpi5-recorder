@@ -146,7 +146,7 @@ sudo systemctl start NetworkManager
 sudo nmcli device wifi connect "TvijSSID" password "xxx"
 ```
 
-Довгостроково — див. коментар у CLAUDE.md про overlayfs / read-only rootfs. Це наступним ходом.
+Довгостроково — overlayfs / read-only rootfs. Це наступним ходом.
 
 ---
 

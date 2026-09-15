@@ -1,14 +1,12 @@
 # WiFi AP + Web Control (Mode C) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** Add a third, parallel recorder control mode: on boot the Pi raises its own WiFi AP (`RPiRecorder` / `12345678`), and a browser at the AP's local IP shows recording status with Start/Stop controls.
 
 **Architecture:** `pi/recording_engine.py` is a new, standalone module holding the transport-agnostic recording pipeline (camera/encoder detection, start/stop, rotation, power-safety sync, crash-resume) — copied out of `pi/ble_recorder.py`, not imported from it. `pi/web_recorder.py` is a small Flask app that imports `recording_engine` and exposes it over HTTP. `pi/install_web.sh` configures a `nmcli`-based WiFi AP and installs `rpi5-web-recorder.service`. This mode is chosen at deploy time (run `install_web.sh` instead of `install_ble.sh`) — never both on one Pi.
 
 **Tech Stack:** Python 3.11+ stdlib (subprocess, threading, json), Flask (via apt `python3-flask`), pytest for local test runs, `nmcli`/NetworkManager for the AP, `rpicam-vid` + `ffmpeg` for the recording pipeline (unchanged from existing modes).
 
-**Spec:** `docs/superpowers/specs/2026-08-19-wifi-ap-web-control-design.md`
+**Spec:** `docs/specs/2026-08-19-wifi-ap-web-control-design.md`
 
 ## Global Constraints
 
@@ -145,7 +143,7 @@ Expected: FAIL/ERROR — `ModuleNotFoundError: No module named 'recording_engine
 
 Copied out of ble_recorder.py's pipeline logic rather than imported from it —
 ble_recorder.py is left untouched by design, see
-docs/superpowers/specs/2026-08-19-wifi-ap-web-control-design.md for why.
+docs/specs/2026-08-19-wifi-ap-web-control-design.md for why.
 No BLE-specific pieces here (manual JSON config, presets, snapshot chunking):
 this engine always runs a single env-configured recording, same convention
 as autostart.sh.
@@ -719,7 +717,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'web_recorder'`.
 """Flask web control for rpi5-recorder Mode C (WiFi AP + web).
 
 Status + Start/Stop only — file table, SSID rename, and raw-data mode are
-separate specs (see docs/superpowers/specs/2026-08-19-wifi-ap-web-control-design.md).
+separate specs (see docs/specs/2026-08-19-wifi-ap-web-control-design.md).
 """
 import os
 import shutil
@@ -940,7 +938,7 @@ Expected: no output (bash -n only reports syntax errors; none expected).
 
 - [ ] **Step 3: Manual review checklist (no live Pi available — document this in the PR)**
 
-Confirm each of these against the spec (`docs/superpowers/specs/2026-08-19-wifi-ap-web-control-design.md`) and this plan's Global Constraints, by reading the script, not by running it:
+Confirm each of these against the spec (`docs/specs/2026-08-19-wifi-ap-web-control-design.md`) and this plan's Global Constraints, by reading the script, not by running it:
 - `apt-get install` list matches what `web_recorder.py`/`recording_engine.py` actually import (Flask, ffmpeg, rpicam-apps) plus `dnsmasq-base` for AP DHCP (see Global Constraints) — no other extra packages.
 - The `NetworkManager` active-check happens before any `nmcli` call, with a clear failure message and non-zero exit.
 - The systemd unit's `AmbientCapabilities`/`CapabilityBoundingSet` lines are present so `WEB_PORT=80` works without `User=root`.
@@ -958,5 +956,5 @@ git commit -m "recorder: add install_web.sh for WiFi AP + web control deploy"
 
 ## After all tasks
 
-- [ ] Update `CLAUDE.md`'s "Про проєкт" section: add a one-line **C. WiFi AP web control** entry after modes A and B, matching their existing format (file paths + one-sentence description), as a follow-up commit after Task 4.
+- [ ] In the project overview ("Про проєкт"), add a one-line **C. WiFi AP web control** entry after modes A and B, matching their existing format (file paths + one-sentence description), as a follow-up commit after Task 4.
 - [ ] Open the PR with an explicit note: no live Raspberry Pi hardware was available during implementation (`recorder`/`recorder2` offline in Tailscale tailnet) — `nmcli` AP behavior and Flask-on-port-80 need field verification before this ships to a real device.
